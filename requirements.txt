@@ -1,6 +1,8 @@
 %pip install -U transformers
 %pip install ipywidgets
 %pip install openpyxl
+print(numpy.__version__)"
+1.26.4
 from huggingface_hub import login
 login("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")
 from transformers import AutoTokenizer, AutoModelForCausalLM
