@@ -1,23 +1,12 @@
-transformers==4.30.0         # For Hugging Face Transformers
-datasets==2.15.0             # For Hugging Face Datasets
-torch==2.1.0+cu121           # PyTorch with CUDA support for GPU acceleration
-bitsandbytes==0.38.1         # For quantization (4-bit loading)
-peft==0.4.0                  # For Parameter-Efficient Fine-Tuning (LoRA)
-tqdm==4.65.0                 # For progress bars
-
-# For Evaluation and Metrics
-scikit-learn==1.2.2          # For regression metrics and data preprocessing
-scipy==1.10.0                # For Pearson/Spearman correlation
-bert-score==0.3.13           # For BERTScore semantic evaluation
-
-# For Data Loading and Processing
-pandas==2.0.1               # For data manipulation and CSV handling
-openpyxl==3.1.2             # For handling Excel files
-
-# Interactive and Notebook Support
-ipywidgets==8.0.0           # For widgets in Jupyter Notebooks
-jupyterlab==3.6.3           # For Jupyter Notebook environment
-
-# Additional utilities
-gitpython==3.1.30           # For Git integration
-huggingface-hub==0.16.4     # For authentication and model downloading
+transformers==4.30.0
+datasets==2.15.0
+torch==2.8.0
+bitsandbytes==0.38.1
+peft==0.4.0
+tqdm==4.65.0
+scikit-learn
+scipy
+bert-score==0.3.13
+pandas==2.0.1
+openpyxl==3.1.2
+huggingface-hub
