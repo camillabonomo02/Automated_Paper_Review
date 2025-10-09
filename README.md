@@ -53,8 +53,8 @@ Ensure your VM includes:
 
 ### 2. Clone the repository
 ```bash
-git clone https://github.com/camillabonomo02/ML_project.git
-cd ML_project
+git clone https://github.com/camillabonomo02/Automated_Paper_Review_project.git
+cd Automated_Paper_Review_project
 ```
 ### 3. Install dependencies
 ```bash
