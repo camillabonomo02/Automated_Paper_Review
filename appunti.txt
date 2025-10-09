@@ -1,3 +1,0 @@
-- Rafforzare la problem statement sottolineando la differenza tra strumenti già esistenti (es. GPT-4 per scrivere feedback generici) e l’approccio mirato a un dataset realistico (OpenReview)
-- specifica bene come estrai le etichette (ad es. parti di review marcate come “strengths/weaknesses”, oppure segmentazione manuale/automatica).
-- come tradurre le predizioni in forma numerica per poi applicare metriche di regressione
