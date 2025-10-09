@@ -6,11 +6,6 @@ The work focuses on automated generation of paper strengths and weaknesses, alon
 
 ---
 
-## Table of Contents
-
-
----
-
 ## Project Overview
 
 Peer reviewing is a cornerstone of scientific communication but remains time-consuming and inconsistent.  
@@ -25,7 +20,7 @@ Evaluation is conducted on both textual and numerical levels, using regression a
 ---
 
 ## Repository Structure
-
+```
 ├── data/
 │ ├── tp_2017conference.xlsx # Original OpenReview dataset (2017)
 │ ├── train.csv # Cleaned training split
@@ -43,7 +38,7 @@ Evaluation is conducted on both textual and numerical levels, using regression a
 ├── zero_shot_predictions.csv # Model predictions before fine-tuning
 ├── finetuned_predictions.csv # Model predictions after fine-tuning
 └── README.md
-
+```
 ---
 ## Setup Instructions
 
@@ -78,6 +73,50 @@ login("your_huggingface_token")
 ---
 
 ## Run the notebooks
+The dataset_stats.ipynb notebook contains a basic dataset exploration and main tokens statistics.
+
+The main.ipynb notebook contains the entire development of the project:
+
+### Dataset preparation
+This cells:
+
+- Load the tp_2017conference.xlsx dataset
+
+- Clean text fields (title, abstract, review)
+
+- Extract numeric scores (rating_num, confidence_num)
+
+- Split into train.csv, val.csv, and test.csv
+
+### Zero-Shot structured review generation
+The base model (LLaMA 3.2B-Instruct) generates structured reviews following a fixed prompt template.
+Outputs are saved as train_structured.csv and val_structured.csv.
+
+### LoRA Fine-Tuning
+Continue in the same notebook (Fine-Tuning section), the cells:
+
+- Load LLaMA 3.2B in 4-bit quantization via bitsandbytes
+
+- Prepare the model using PEFT (prepare_model_for_kbit_training)
+
+- Fine-tunes via LoRA adapters
+
+- Saves weights under notebooks/finetuned-llama3-lora/
+
+### Generate predictions and apply to test set
+After fine-tuning, run the model to generate predictions on the test set using both zero-shot and fine-tuned models.
+These predictions will be saved in zero_shot_predictions.csv and finetuned_predictions.csv.
+
+### Evaluation
+The final cells evaluate:
+
+- Regression metrics: MAE, RMSE, R², Pearson, Spearman
+- Semantic alignment: BERTScore (F1)
+
+## Discussion
+The fine-tuned model successfully learns the review structure and improves textual alignment with human-written reviews.
+However, confidence prediction remains inconsistent, suggesting that reviewer uncertainty cannot be reliably inferred from text alone.
 
 
+#### Project developed by Camilla Bonomo
 
