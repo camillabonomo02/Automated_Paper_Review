@@ -25,18 +25,24 @@ Evaluation is conducted on both textual and numerical levels, using regression a
 │ ├── tp_2017conference.xlsx # Original OpenReview dataset (2017)
 │ ├── train.csv # Cleaned training split
 │ ├── val.csv # Validation split
-│ └── test.csv # Test split
+│ ├── test.csv # Test split
+│ ├── train_structured.csv # Zero-shot distilled structured reviews (train set)
+│ └── val_structured.csv # Zero-shot distilled structured reviews (validation set)
 │
 ├── notebooks/
 │ ├── main.ipynb # Main training + evaluation pipeline
 │ ├── dataset_stats.ipynb # Dataset exploration and token analysis
+│
+├── model/
 │ ├── finetuned-llama3/ # Model outputs and checkpoints
 │ └── finetuned-llama3-lora/ # Final fine-tuned LoRA weights
 │
-├── train_structured.csv # Zero-shot distilled structured reviews (train set)
-├── val_structured.csv # Zero-shot distilled structured reviews (validation set)
-├── zero_shot_predictions.csv # Model predictions before fine-tuning
-├── finetuned_predictions.csv # Model predictions after fine-tuning
+├── output/
+│ ├── zero_shot_predictions.csv # Model predictions before fine-tuning
+│ └── finetuned_predictions.csv # Model predictions after fine-tuning
+│
+├── Fine-tuning a Small LLM with LoRA for Automated Paper Review Insights.pdf
+├── requirements.txt
 └── README.md
 ```
 ---
