@@ -9,3 +9,5 @@ bert-score
 pandas
 scipy
 openpyxl
+matplotlib
+numpy
