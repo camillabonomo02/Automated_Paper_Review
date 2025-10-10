@@ -110,7 +110,7 @@ These predictions will be saved in zero_shot_predictions.csv and finetuned_predi
 ### Evaluation
 The final cells evaluate:
 
-- Regression metrics: MAE, RMSE, R², Pearson, Spearman
+- Regression metrics: MAE, RMSE, R², Pearson
 - Semantic alignment: BERTScore (F1)
 
 ## Discussion
