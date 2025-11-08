@@ -68,7 +68,7 @@ pip install -r requirements.txt
 ```
 
 ### 4. Authenticate with Hugging Face
-In the section of the notebook dedicated to the Hugging Face log in insert your own or use the given one if not expired. This grants access to download meta-llama/Llama-3.2-3B-Instruct.
+In the section of the notebook dedicated to the Hugging Face log in insert your own token. This grants access to download meta-llama/Llama-3.2-3B-Instruct.
 To generate your how token access at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and generate a fine-grained token for meta-llama\Llama 3.2-3B-Instruct and selct at least "Read acess to contents on selcted repos".
 Then log in:
 
