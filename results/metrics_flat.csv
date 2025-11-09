@@ -1,0 +1,27 @@
+,0
+baseline.rate_mean_baseline.MAE,1.1126360602267986
+baseline.rate_mean_baseline.RMSE,1.3208491191846015
+baseline.rate_mean_baseline.R2,-2.9764066615367568e-05
+baseline.rate_mean_baseline.Pearson,
+baseline.rate_mean_baseline.MAE_CI,"[0.9760577852998067, 1.2579793160010622]"
+baseline.rate_mean_baseline.RMSE_CI,"[1.1731213136132626, 1.470720167473086]"
+baseline.rate_len_linear.MAE,1.127831720091299
+baseline.rate_len_linear.RMSE,1.3338594047664862
+baseline.rate_len_linear.R2,-0.019827256163599705
+baseline.rate_len_linear.Pearson,-0.1111886719986013
+baseline.rate_len_linear.MAE_CI,"[0.9918050477270753, 1.2746980347389]"
+baseline.rate_len_linear.RMSE_CI,"[1.1859016197392114, 1.4858877924171991]"
+zero_shot.rate_zero_shot.MAE,3.9391843971631206
+zero_shot.rate_zero_shot.RMSE,4.285873836104733
+zero_shot.rate_zero_shot.R2,-9.528954995272073
+zero_shot.rate_zero_shot.Pearson,0.01600015468784743
+zero_shot.rate_zero_shot_calibration.a,1.0
+zero_shot.rate_zero_shot_calibration.b,0.0
+zero_shot.strengths.bertscore.F1.mean,-0.4407111091758781
+zero_shot.weaknesses.bertscore.F1.mean,0.03710615770529678
+zero_shot.strengths.bertscore.F1.CI,"[-0.6735036855787992, -0.2339534848266301]"
+zero_shot.weaknesses.bertscore.F1.CI,"[0.02396408719366089, 0.049851802619826795]"
+distilled.strengths.bertscore.F1.mean,-0.4285957915386423
+distilled.weaknesses.bertscore.F1.mean,0.03452677646047495
+distilled.strengths.bertscore.F1.CI,"[-0.6624234652461886, -0.22642458268469748]"
+distilled.weaknesses.bertscore.F1.CI,"[0.02193962574919111, 0.0470706778110322]"
