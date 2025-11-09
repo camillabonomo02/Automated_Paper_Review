@@ -9,16 +9,16 @@
       },
       "_type": "List"
     },
-    "attention_mask": {
+    "labels": {
       "feature": {
-        "dtype": "int8",
+        "dtype": "int64",
         "_type": "Value"
       },
       "_type": "List"
     },
-    "labels": {
+    "attention_mask": {
       "feature": {
-        "dtype": "int64",
+        "dtype": "int8",
         "_type": "Value"
       },
       "_type": "List"
