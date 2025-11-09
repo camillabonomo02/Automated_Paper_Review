@@ -1,0 +1,8 @@
+{
+  "python": "3.13.7",
+  "torch": "2.9.0",
+  "cuda_available": false,
+  "device": "cpu",
+  "seed": 42,
+  "timestamp": "2025-11-09T15:16:57.537364"
+}
