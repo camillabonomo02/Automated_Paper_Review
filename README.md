@@ -126,3 +126,28 @@ However, confidence prediction remains inconsistent, suggesting that reviewer un
 
 #### Project developed by Camilla Bonomo
 
+"""
+Paper Review Pipeline (rate + strengths/weaknesses) — concise, proposal-aligned
+
+What this script does:
+1) PREPARE: Read your Excel/CSV (Seafoodair/OpenReview 2020) and make train/val splits.
+   Required columns in the file: title, abstract, review, rate
+2) DISTILL: Ask a small LLM for STRICT JSON with {strengths[3], weaknesses[3], rate:float}.
+3) DATASETS + LORA: Build HF datasets and fine-tune with LoRA (small, fast).
+4) NUMERIC EVAL: Baselines + zero-shot regression metrics for 'rate' (MAE/RMSE/R2/Pearson + CI).
+5) HUMAN REFS: Extract human Strengths/Weaknesses from the review text (deterministic heuristic).
+6) S/W EVAL: Compare model S/W (zero-shot and distilled) to human S/W with BERTScore (± CI).
+7) PLOTS: Merge metrics and render a simple MAE plot (rate) + BERTScore plot (S/W).
+
+CLI (common):
+  python paper_review_pipeline.py --step prepare --source excel --xlsx data/tp_2020conference.xlsx
+  python paper_review_pipeline.py --step distill --limit 200
+  python paper_review_pipeline.py --step buildds
+  python paper_review_pipeline.py --step finetune
+  python paper_review_pipeline.py --step baselines
+  python paper_review_pipeline.py --step zseval
+  python paper_review_pipeline.py --step refs
+  python paper_review_pipeline.py --step zssw
+  python paper_review_pipeline.py --step evalsw
+  python paper_review_pipeline.py --step plot
+"""

@@ -1,4 +1,4 @@
-torch==2.3.*           
+torch<2.3.0,>=2.2.0           
 transformers==4.43.4
 tokenizers==0.19.1
 accelerate<1.0
@@ -10,4 +10,5 @@ pandas
 matplotlib
 openpyxl
 tqdm
-bitsandbytes==0.43.1 ; platform_system=="Linux" and platform_machine=="x86_64"
+bitsandbytes==0.43.1
+triton==2.3.1

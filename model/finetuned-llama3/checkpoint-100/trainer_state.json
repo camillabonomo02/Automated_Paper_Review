@@ -1,0 +1,78 @@
+{
+  "best_metric": 1.365036129951477,
+  "best_model_checkpoint": "/home/disi/Automated_Paper_Review-1/model/finetuned-llama3/checkpoint-100",
+  "epoch": 2.1390374331550803,
+  "eval_steps": 100,
+  "global_step": 100,
+  "is_hyper_param_search": false,
+  "is_local_process_zero": true,
+  "is_world_process_zero": true,
+  "log_history": [
+    {
+      "epoch": 0.5347593582887701,
+      "grad_norm": 1.1473339796066284,
+      "learning_rate": 1.7251908396946566e-05,
+      "loss": 3.1371,
+      "step": 25
+    },
+    {
+      "epoch": 1.0695187165775402,
+      "grad_norm": 1.1117295026779175,
+      "learning_rate": 1.3435114503816796e-05,
+      "loss": 2.5258,
+      "step": 50
+    },
+    {
+      "epoch": 1.6042780748663101,
+      "grad_norm": 1.1865363121032715,
+      "learning_rate": 9.618320610687025e-06,
+      "loss": 1.9392,
+      "step": 75
+    },
+    {
+      "epoch": 2.1390374331550803,
+      "grad_norm": 0.7717399001121521,
+      "learning_rate": 5.801526717557252e-06,
+      "loss": 1.4688,
+      "step": 100
+    },
+    {
+      "epoch": 2.1390374331550803,
+      "eval_loss": 1.365036129951477,
+      "eval_runtime": 15.671,
+      "eval_samples_per_second": 5.998,
+      "eval_steps_per_second": 5.998,
+      "step": 100
+    }
+  ],
+  "logging_steps": 25,
+  "max_steps": 138,
+  "num_input_tokens_seen": 0,
+  "num_train_epochs": 3,
+  "save_steps": 100,
+  "stateful_callbacks": {
+    "EarlyStoppingCallback": {
+      "args": {
+        "early_stopping_patience": 3,
+        "early_stopping_threshold": 0.0
+      },
+      "attributes": {
+        "early_stopping_patience_counter": 0
+      }
+    },
+    "TrainerControl": {
+      "args": {
+        "should_epoch_stop": false,
+        "should_evaluate": false,
+        "should_log": false,
+        "should_save": true,
+        "should_training_stop": false
+      },
+      "attributes": {}
+    }
+  },
+  "total_flos": 6957230456832000.0,
+  "train_batch_size": 1,
+  "trial_name": null,
+  "trial_params": null
+}
