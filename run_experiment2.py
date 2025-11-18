@@ -1,10 +1,10 @@
-# run_experiment.py
+# run_experiment2.py
 # ======================================================
 # Proposal-2: S/W + Rate from Title+Abstract
 # Model: LLaMA 3.2 3B Instruct with LoRA (4-bit)
 #
 # Pipeline steps:
-#   prepare   -> clean & split (train/val) with rate_mean per title
+#   prepare   -> clean & split (train/val) with rate_mean per (title_key)
 #   sup       -> build supervised targets from human reviews (+rate_mean)
 #   buildds   -> tokenize masked chat datasets (JSON target)
 #   finetune  -> LoRA SFT on JSON {strengths, weaknesses, rate}
@@ -81,7 +81,7 @@ def to_chat_prompt_with_template(tokenizer, system: str, user: str) -> str:
 
 # ---------- Cleaning & Target Extraction ----------
 _WS = re.compile(r"\s+")
-_SEC_HDR = re.compile(r"^\s*(review|summary|overview|strengths?|pros|advantages?|weakness(es)?|cons|limitations?|comments?|questions?)\s*[:\-–#]*\s*$", re.I)
+_SEC_HDR = re.compile(r"^\s*(review|summary|overview|strengths?|pros|advantages?|weaknesses?|cons|limitations?|comments?|questions?)\s*[:\-–#]*\s*$", re.I)
 _MD_BULLET = re.compile(r"^\s*([\-\*\•]|\d{1,2}\.)\s+")
 _URL = re.compile(r"https?://\S+")
 _BRACKETS = re.compile(r"\[[^\]]{0,120}\]|\([^)]{0,120}\)")
@@ -99,10 +99,14 @@ _NEG = [
 ]
 _POS_RE = re.compile("|".join(_POS), re.I)
 _NEG_RE = re.compile("|".join(_NEG), re.I)
-_GENERIC_STR = re.compile(r"^(the paper (is|was)|well[-\s]?written|interesting|good|nice)\b", re.I)
+_GENERIC_STR = re.compile(
+    r"^\s*(?:the|this|a|an)?\s*(?:paper)?\s*(?:is|was|'s)?\s*"
+    r"(?:interesting|good|nice|well[-\s]?written|well[-\s]?presented|well[-\s]?described)\b",
+    re.I
+)
 
 def _clean_abstract(a: str) -> str:
-    """Stricter: remove 'Abstract:###' once, any leftover '###', URLs, collapse whitespace."""
+    """Pulisce 'Abstract:###', eventuali '###', URL, spazi."""
     a = str(a or "")
     if a.startswith("Abstract:###"):
         a = a[len("Abstract:###"):]
@@ -112,17 +116,17 @@ def _clean_abstract(a: str) -> str:
     a = _WS.sub(" ", a).strip()
     return a
 
-def _strip_review_prefix(t: str) -> str:
-    """Only remove 'Review:###' prefix/markers; KEEP section headers for S/W parsing."""
-    s = str(t or "")
-    if s.startswith("Review:###"):
-        s = s[len("Review:###"):]
-    s = s.replace("Review:###", " ")
-    s = s.replace("###", " ")
-    return _WS.sub(" ", s).strip()
+def _strip_review_prefix(s: str) -> str:
+    """Rimuove solo prefissi 'Review:###'/'###' e normalizza spazi; NON elimina header utili."""
+    t = str(s or "")
+    if t.startswith("Review:###"):
+        t = t[len("Review:###"):]
+    t = t.replace("Review:###", " ")
+    t = t.replace("###", " ")
+    return _WS.sub(" ", t).strip()
 
 def _preclean_review(text: str) -> str:
-    """Aggressive cleaner for polarity fallback; used *inside* extraction, not in prepare."""
+    """Pulizia aggressiva per il fallback di polarità (usata dentro l'estrattore)."""
     t = str(text or "")
     if t.startswith("Review:###"):
         t = t[len("Review:###"):]
@@ -131,7 +135,7 @@ def _preclean_review(text: str) -> str:
     out = []
     for ln in t.splitlines():
         ln = _MD_BULLET.sub("", ln).strip()
-        if _SEC_HDR.match(ln):
+        if _SEC_HDR.match(ln):  # salta header
             continue
         out.append(ln)
     t = " ".join(out)
@@ -157,7 +161,7 @@ def _score_polarity(s: str) -> Tuple[int,int]:
     pos = len(_POS_RE.findall(s))
     neg = len(_NEG_RE.findall(s))
     if "?" in s: neg += 1
-    if pos > 0 and neg > 0: neg += 1  # mixed → lean negative
+    if pos > 0 and neg > 0: neg += 1
     return pos, neg
 
 def _diverse_topk(cands: List[str], k=3) -> List[str]:
@@ -183,14 +187,13 @@ def _diverse_topk(cands: List[str], k=3) -> List[str]:
         return out
 
 def _section_parse(review_text: str) -> Dict[str, List[str]]:
-    """Prefer explicit Strengths/Weaknesses sections if present."""
     lines = [l.strip() for l in (review_text or "").splitlines()]
     sections = {}
     current = None
     for ln in lines:
-        if re.match(r"^\s*(strengths?|pros|advantages?)\s*[:\--#]*\s*$", ln, re.I): current = "S"; continue
-        if re.match(r"^\s*(weakness(es)?|cons|limitations?)\s*[:\--#]*\s*$", ln, re.I): current = "W"; continue
-        if re.match(r"^\s*(summary|overview|review|comments?|questions?)\s*[:\--#]*\s*$", ln, re.I): current = None; continue
+        if re.match(r"^\s*(strengths?|pros|advantages?)\s*[:\-\-#]*\s*$", ln, re.I): current = "S"; continue
+        if re.match(r"^\s*(weakness(es)?|cons|limitations?)\s*[:\-\-#]*\s*$", ln, re.I): current = "W"; continue
+        if re.match(r"^\s*(summary|overview|review|comments?|questions?)\s*[:\-\-#]*\s*$", ln, re.I): current = None; continue
         if not ln: continue
         if current:
             ln = _MD_BULLET.sub("", ln)
@@ -202,22 +205,19 @@ def _section_parse(review_text: str) -> Dict[str, List[str]]:
     return out
 
 def extract_sw_from_review(review_text: str, k=3) -> Dict[str, List[str]]:
-    """Deterministic, section-first extractor; falls back to polarity scoring."""
-    # Section parse first (on original, only prefix-stripped review stored in dataset)
     sec = _section_parse(review_text)
-    S_sec = [s for s in sec["S"] if 10 <= len(s) <= 280 and not GENERIC_STR.match(s)]
+    S_sec = [s for s in sec["S"] if 10 <= len(s) <= 280 and not _GENERIC_STR.match(s)]
     W_sec = [s for s in sec["W"] if 10 <= len(s) <= 280]
     if S_sec or W_sec:
         S = _diverse_topk(S_sec, k)
         W = _diverse_topk(W_sec, k)
         return {"strengths": S, "weaknesses": W}
 
-    # Fallback: polarity-based scorer on aggressively cleaned review
     t = _preclean_review(review_text)
     sents = _split_sentences_and_clauses(t)
     pos_cand, neg_cand = [], []
     for s in sents:
-        if GENERIC_STR.match(s):  # drop generic praise
+        if _GENERIC_STR.match(s):  # drop generic praise
             continue
         pos, neg = _score_polarity(s)
         if pos==0 and neg==0: continue
@@ -231,52 +231,209 @@ def extract_sw_from_review(review_text: str, k=3) -> Dict[str, List[str]]:
     W = _diverse_topk([s for _,s in neg_cand][:10], k)
     return {"strengths": S, "weaknesses": W}
 
-# --- prepare: keep headers, only strip prefixes; use numeric rate column strictly
+# =========================
+# --------- RATING --------
+# =========================
+
+def _norm_title(t: str) -> str:
+    return _WS.sub(" ", str(t or "").strip()).lower()
+
+_RATE_MIN, _RATE_MAX = 1.0, 10.0
+
+def _norm_decimal_str(s: str) -> str:
+    s = str(s).strip().replace("\u00A0"," ").replace("\u2009"," ")
+    return s.replace(",", ".")
+
+def _parse_rate_value(raw) -> Optional[float]:
+    """Accetta '7', '7,5', '8/10', '85/100', 'score: 7.0/10' ecc. Clippa su [1,10]."""
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)): return None
+    txt = _norm_decimal_str(raw)
+    if not txt or txt.lower() in {"na","n/a","nan","none","-"}: return None
+
+    m = re.search(r'(\d+(?:\.\d+)?)\s*/\s*(\d+)', txt)
+    if m:
+        num = float(m.group(1)); den = float(m.group(2))
+        if den > 0:
+            val = num * (10.0/den)
+            return float(min(_RATE_MAX, max(_RATE_MIN, val)))
+
+    m = re.search(r'(?<!\d)(\d+(?:\.\d+)?)(?!/)', txt)
+    if m:
+        val = float(m.group(1))
+        return float(min(_RATE_MAX, max(_RATE_MIN, val)))
+    return None
+
+# mapping etichette testuali comuni
+_TEXT_RATING_MAP = [
+    (r"\bstrong\s+accept\b", 9.5),
+    (r"\baccept\b",          8.0),
+    (r"\bweak\s+accept\b",   7.0),
+    (r"\bborderline\b",      6.0),
+    (r"\bweak\s+reject\b",   4.5),
+    (r"\breject\b",          3.0),
+    (r"\bstrong\s+reject\b", 1.5),
+]
+
+def _parse_textual_label_as_rate(txt: str) -> Optional[float]:
+    if not isinstance(txt, str) or not txt.strip(): return None
+    s = txt.lower()
+    for pat, val in _TEXT_RATING_MAP:
+        if re.search(pat, s, flags=re.I):
+            return float(val)
+    return None
+
+# pattern numerici nel testo review
+_RATE_PATTERNS_REVIEW = [
+    r"\b(rating|rate|overall|score|recommendation)\s*[:=\-]\s*(\d+(?:[\.,]\d+)?)\b",
+    r"\b(\d+(?:[\.,]\d+)?)\s*/\s*(10|100)\b",
+]
+
+def _parse_rate_from_review_text(txt: str) -> Optional[float]:
+    if not isinstance(txt, str) or not txt.strip(): return None
+    s = _norm_decimal_str(txt.lower())
+    for pat in _RATE_PATTERNS_REVIEW:
+        m = re.search(pat, s, flags=re.I)
+        if not m: continue
+        groups = [g for g in m.groups() if g is not None]
+        nums, den = [], None
+        for g in groups:
+            g2 = g.strip()
+            if re.fullmatch(r"\d+(?:\.\d+)?", g2): nums.append(float(g2))
+            if g2 in {"10","100"}: den = int(g2)
+        if nums:
+            val = nums[-1]
+            if den == 100: val = val/10.0
+            return float(min(_RATE_MAX, max(_RATE_MIN, val)))
+    return None
+
+# ---- SPECIFICO: colonna 'paper_score' come "Rating:###6: Weak Accept"
+def _parse_rate_from_paper_score(cell) -> Optional[float]:
+    if cell is None or (isinstance(cell, float) and np.isnan(cell)): return None
+    s = str(cell)
+    # rimuovi "Rating:###" e normalizza separatori tipo ":" o "-"
+    s = s.replace("Rating:###", " ").replace("###", " ")
+    s = _norm_decimal_str(s)
+    # 1) prova numero esplicito
+    num = _parse_rate_value(s)
+    if num is not None:
+        return num
+    # 2) fallback: mappa etichetta testuale (Weak Accept ecc.)
+    lab = _parse_textual_label_as_rate(s)
+    return lab
+
+def _find_rate_columns(columns):
+    cols = [c for c in columns]
+    low = [c.lower().strip() for c in columns]
+    cand_keys = {"rate","rating","overall","recommendation","score","final rating","meta rating","paper_score"}
+    picks = []
+    for i, c in enumerate(low):
+        if any(k == c or re.search(rf"\b{k}\b", c) for k in cand_keys):
+            if "confidence" in c:
+                continue
+            picks.append(cols[i])
+    seen=set(); out=[]
+    for c in picks:
+        if c not in seen:
+            seen.add(c); out.append(c)
+    return out
+
+# ====================================================
+# ----------------- PREPARE STEP ---------------------
+# ====================================================
 def step_prepare(x_path: pathlib.Path):
-    # load
+    # 1) leggi
     if x_path.suffix.lower() == ".csv":
         df = pd.read_csv(x_path)
     else:
-        df = pd.read_excel(x_path)
+        df = pd.read_excel(x_path, engine="openpyxl")
     df.columns = [c.strip() for c in df.columns]
 
-    # must have these
-    needed = ["title", "abstract", "review"]
+    needed = ["title","abstract","review"]
     miss = [c for c in needed if c not in df.columns]
-    assert not miss, f"Missing columns: {miss}"
+    assert not miss, f"Mancano colonne: {miss}"
 
-    # clean text fields
+    # 2) pulizia testi base
     df = df.dropna(subset=["title","abstract","review"]).copy()
     df["abstract"] = df["abstract"].map(_clean_abstract)
-    # IMPORTANT: keep section headers; only strip the Review:### prefix markers
-    df["review"]   = df["review"].map(_strip_review_prefix)
+    df["review"]   = df["review"].map(lambda x: _strip_review_prefix(x) if isinstance(x,str) else str(x))
 
-    # choose the numeric rate column from the sheet
-    rate_cols = [c for c in df.columns if c.lower() in {"rate","rating","score","overall","overall_rating"}]
-    assert rate_cols, "No numeric rate column found (expected one of: rate, rating, score, overall, overall_rating)."
-    rc = rate_cols[0]
-    df["rate_num"] = pd.to_numeric(df[rc], errors="coerce")  # keep only true numbers
+    # 3) chiave normalizzata per il groupby
+    df["title_key"] = df["title"].map(_norm_title)
 
-    # group by title
-    grp = df.groupby("title", as_index=False).agg(
-        abstract=("abstract","first"),
-        review=("review", lambda s: "\n\n".join(map(str, s))),
-        rate_mean=("rate_num", "mean")  # mean over only numeric rows
+    # 4) individua tutte le colonne rating (inclusa 'paper_score')
+    rate_cols = _find_rate_columns(df.columns)
+    assert rate_cols, "Nessuna colonna di rating trovata (rate/rating/overall/score/paper_score/...)."
+    print(f"[prepare] Colonne rating candidate: {rate_cols}")
+
+    # 5) parsing per colonna + parsing specifico 'paper_score'
+    parsed_cols = {}
+    for c in rate_cols:
+        if c.strip().lower() == "paper_score":
+            parsed = df[c].apply(_parse_rate_from_paper_score).astype(float)
+        else:
+            parsed = df[c].apply(_parse_rate_value).astype(float)
+        parsed_cols[c] = parsed
+
+    # coverage per colonna
+    src_cov = {c: (~s.isna()).mean() for c, s in parsed_cols.items()}
+    print("[prepare] Coverage per colonna:", {k: f"{v:.1%}" for k,v in src_cov.items()})
+
+    # 6) fusione: prendi il primo valore disponibile nell'ordine di rate_cols
+    def _fuse_row(idx):
+        for c in rate_cols:
+            v = parsed_cols[c].iat[idx]
+            if not (v is None or (isinstance(v,float) and np.isnan(v))):
+                return float(v)
+        # fallback dal testo review: numero esplicito
+        v = _parse_rate_from_review_text(df["review"].iat[idx])
+        if v is not None: return float(v)
+        # fallback da etichetta testuale
+        v = _parse_textual_label_as_rate(df["review"].iat[idx])
+        if v is not None: return float(v)
+        return np.nan
+
+    df["rate_num_fused"] = [ _fuse_row(i) for i in range(len(df)) ]
+    cov_fused = (~pd.Series(df["rate_num_fused"]).isna()).mean()
+    print(f"[prepare] Coverage rate (fusione colonne + review + label): {cov_fused:.1%}")
+
+    # esempi falliti (celle presenti ma non parsate)
+    any_raw = df[rate_cols].apply(lambda x: x.astype(str).str.strip().str.len()>0, axis=0).any(axis=1)
+    bad = df[any_raw & pd.Series(df["rate_num_fused"]).isna()]
+    if len(bad) > 0:
+        cols_to_dump = ["title","paper_score","review"] if "paper_score" in df.columns else ["title","review"]
+        (bad[cols_to_dump].head(50)).to_csv(RESULTS_DIR/"rate_parse_fail_examples.csv", index=False)
+        print("[prepare] esempi non parsati → results/rate_parse_fail_examples.csv")
+
+    # 7) aggregazione per titolo
+    grp = (df
+        .sort_values(["title_key"])
+        .groupby("title_key", as_index=False)
+        .agg(
+            title      = ("title","first"),
+            abstract   = ("abstract","first"),
+            review     = ("review", lambda s: "\n\n".join(map(str, s))),
+            rate_mean  = ("rate_num_fused","mean"),
+            n_reviews  = ("review","size"),
+            n_rated    = ("rate_num_fused", lambda s: (~pd.Series(s).isna()).sum())
+        )
     )
 
-    # split reproducibly
+    # 8) split
     from sklearn.model_selection import train_test_split
     train_df, val_df = train_test_split(grp, test_size=0.2, random_state=SEED, shuffle=True)
+    train_df.to_csv(DATA_DIR/"train_clean.csv", index=False)
+    val_df.to_csv(DATA_DIR/"val_clean.csv", index=False)
 
-    # save
-    train_df.to_csv(DATA_DIR / "train_clean.csv", index=False)
-    val_df.to_csv(DATA_DIR / "val_clean.csv", index=False)
-
-    # quick sanity report
     cov_train = (~train_df["rate_mean"].isna()).mean()
     cov_val   = (~val_df["rate_mean"].isna()).mean()
-    print(f"[prepare] train={len(train_df)} val={len(val_df)} | rate coverage: "
-          f"train={cov_train:.1%} val={cov_val:.1%}")
+    print(f"[prepare] train={len(train_df)} val={len(val_df)} | coverage rate_mean: train={cov_train:.1%} val={cov_val:.1%}")
+
+    # 9) diagnostica titoli senza alcun voto numerico
+    gap = (grp[(grp["n_reviews"]>0) & (grp["n_rated"]==0)]
+           .sort_values("n_reviews", ascending=False))
+    if len(gap):
+        gap[["title","n_reviews","n_rated"]].to_csv(RESULTS_DIR/"titles_no_numeric_rate.csv", index=False)
+        print(f"[prepare] {len(gap)} titoli senza alcun voto numerico → results/titles_no_numeric_rate.csv")
 
 # ---------- Supervised Targets (TRAIN & VAL) ----------
 def step_make_supervised_targets(src_csv: pathlib.Path, out_csv: pathlib.Path, k=3, is_train=False):
@@ -287,7 +444,6 @@ def step_make_supervised_targets(src_csv: pathlib.Path, out_csv: pathlib.Path, k
         rate = r.get("rate_mean", np.nan)
         rate = float(rate) if pd.notna(rate) else np.nan
 
-        # For TRAIN: require numeric rate so model truly learns rate
         if is_train and np.isnan(rate):
             continue
 
@@ -373,8 +529,10 @@ def finetune_lora():
     )
     model = get_peft_model(base, lora_cfg)
 
+    from datasets import load_from_disk
     tr = load_from_disk(str(DATA_DIR / "train_tokenized"))
     va = load_from_disk(str(DATA_DIR / "val_tokenized"))
+    from transformers import DataCollatorForLanguageModeling
     coll = DataCollatorForLanguageModeling(tokenizer=tok, mlm=False)
 
     from transformers import EarlyStoppingCallback
@@ -513,22 +671,47 @@ def _bootstrap_ci_scalar(values: List[float], alpha=0.05, seed=SEED) -> Tuple[fl
 
 def _bertscore_bestmatch(cands: List[str], refs: List[str], lang="en"):
     from bert_score import score as bertscore
-    cands = [c for c in cands if c.strip()]; refs = [r for r in refs if r.strip()]
-    if not cands or not refs: return float("nan")
-    _, _, F1 = bertscore(cands, refs, lang=lang, rescale_with_baseline=True)
-    F = F1.numpy() if hasattr(F1, "numpy") else np.array(F1)
-    used_r = set(); scores = []
-    # greedy best matching
-    if F.ndim == 1:  # equal length fallback
-        return float(np.mean(F))
-    for i in range(len(cands)):
-        best_j, best_val = None, -1.0
-        for j in range(len(refs)):
-            if j in used_r: continue
-            v = float(F[i, j])
-            if v > best_val: best_val, best_j = v, j
-        if best_j is not None:
-            used_r.add(best_j); scores.append(best_val)
+    # normalize lists
+    cands = [c for c in (cands or []) if isinstance(c, str) and c.strip()]
+    refs = [r for r in (refs or []) if isinstance(r, str) and r.strip()]
+    if not cands or not refs:
+        return float("nan")
+
+    # fast path when lengths match 1:1
+    if len(cands) == len(refs):
+        _, _, F1 = bertscore(cands, refs, lang=lang, rescale_with_baseline=True)
+        F = F1.numpy() if hasattr(F1, "numpy") else np.array(F1)
+        # if vector, return mean
+        if F.ndim == 1:
+            return float(np.mean(F))
+    # build full pairwise matrix: shape (n_cands, n_refs)
+    n_c, n_r = len(cands), len(refs)
+    Fmat = np.zeros((n_c, n_r), dtype=float)
+    for j, ref in enumerate(refs):
+        # compute scores of all candidates vs this single ref (column)
+        _, _, Fcol = bertscore(cands, [ref] * n_c, lang=lang, rescale_with_baseline=True)
+        col = Fcol.numpy() if hasattr(Fcol, "numpy") else np.array(Fcol)
+        Fmat[:, j] = col
+
+    # Greedy best-match: order candidates by their best possible match (desc),
+    # then assign each the best remaining reference.
+    bests = [(i, int(Fmat[i].argmax()), float(Fmat[i].max())) for i in range(n_c)]
+    bests.sort(key=lambda x: -x[2])
+    used = set()
+    scores = []
+    for i, best_j, best_val in bests:
+        if best_j not in used:
+            used.add(best_j)
+            scores.append(best_val)
+            continue
+        # find next-best unused ref for this candidate
+        unused = [j for j in range(n_r) if j not in used]
+        if not unused:
+            continue
+        j2 = max(unused, key=lambda j: Fmat[i, j])
+        used.add(j2)
+        scores.append(float(Fmat[i, j2]))
+
     return float(np.mean(scores)) if scores else float("nan")
 
 def step_build_sw_references(split_csv: pathlib.Path, out_json: pathlib.Path):
@@ -643,7 +826,6 @@ def step_eval_rate():
     zs = _load_pred(RESULTS_DIR / "val_zeroshot_structured.csv")
     ft = _load_pred(RESULTS_DIR / "val_ft_structured.csv")
 
-    # align helper
     def _align(pred_map):
         yt, yp = [], []
         for t, y in y_true_map.items():
@@ -655,7 +837,6 @@ def step_eval_rate():
     yt_zs, yp_zs = _align(zs)
     yt_ft, yp_ft = _align(ft)
 
-    # baselines
     tr = pd.read_csv(DATA_DIR / "train_clean.csv").dropna(subset=["rate_mean"])
     mean_pred = float(np.nanmean(tr["rate_mean"]))
     yt_base = list(y_true_map.values())
@@ -670,7 +851,6 @@ def step_eval_rate():
     yp_lin = [float(p) for p in yp_lin_full]
     yt_lin = yt_base
 
-    # calibration
     a, b = _fit_rate_calibrator(DATA_DIR / "train_structured.csv", DATA_DIR / "train_clean.csv")
     yp_zs_cal = _apply_calibration(yp_zs, a, b) if yp_zs else []
     yp_ft_cal = _apply_calibration(yp_ft, a, b) if yp_ft else []
@@ -693,7 +873,6 @@ def step_eval_rate():
     metrics.update(pack_metrics("finetuned.cal", yt_ft, yp_ft_cal))
     (RESULTS_DIR / "rate_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    # merge flat
     flat_p = RESULTS_DIR / "metrics_flat.json"
     flat = json.loads(flat_p.read_text(encoding="utf-8")) if flat_p.exists() else {}
     for k, v in metrics.items():
@@ -720,7 +899,6 @@ def step_plot_and_merge():
     (RESULTS_DIR / "metrics_flat.json").write_text(json.dumps(merged, indent=2), encoding="utf-8")
     print("[merge] metrics_flat.{json,csv} saved")
 
-    # SW bar
     keys_sw = [
         ("zeroshot.strengths.bertscore.F1.mean", "ZS Strengths"),
         ("zeroshot.weaknesses.bertscore.F1.mean", "ZS Weaknesses"),
@@ -740,7 +918,6 @@ def step_plot_and_merge():
         plt.tight_layout(); fig.savefig(RESULTS_DIR / "sw_bertscore_plot.png", dpi=160)
         print("[plot] sw_bertscore_plot.png saved")
 
-    # Rate MAE bar
     mae_keys = [
         ("rate.baseline.mean.MAE", "BL Mean"),
         ("rate.baseline.len_linear.MAE", "BL LenLin"),

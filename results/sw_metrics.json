@@ -1,0 +1,22 @@
+{
+  "zeroshot.strengths.bertscore.F1.mean": 0.06713446409667836,
+  "zeroshot.strengths.bertscore.F1.CI": [
+    0.05900698540819662,
+    0.07485548163606254
+  ],
+  "zeroshot.weaknesses.bertscore.F1.mean": 0.02467163555169632,
+  "zeroshot.weaknesses.bertscore.F1.CI": [
+    0.017345762390920637,
+    0.03196947889135076
+  ],
+  "finetuned.strengths.bertscore.F1.mean": 0.26177723368012173,
+  "finetuned.strengths.bertscore.F1.CI": [
+    0.2527022230200586,
+    0.27004895928727984
+  ],
+  "finetuned.weaknesses.bertscore.F1.mean": 0.13780889795105225,
+  "finetuned.weaknesses.bertscore.F1.CI": [
+    0.12994492478472622,
+    0.1463006689196249
+  ]
+}
