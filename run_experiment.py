@@ -1,27 +1,42 @@
-# paper_review_pipeline.py
+# run_experiment.py
 # ======================================================
-# Paper Review Pipeline (rate + strengths/weaknesses)
+# Proposal-2: S/W + Rate from Title+Abstract
+# Model: LLaMA 3.2 3B Instruct with LoRA (4-bit)
+#
+# Pipeline steps:
+#   prepare   -> clean & split (train/val) with rate_mean per (title_key)
+#   sup       -> build supervised targets from human reviews (+rate_mean)
+#   buildds   -> tokenize masked chat datasets (JSON target)
+#   finetune  -> LoRA SFT on JSON {strengths, weaknesses, rate}
+#   zstrain   -> zero-shot JSON on TRAIN (for calibration)
+#   zseval    -> zero-shot JSON on VAL
+#   infer_ft  -> finetuned JSON on VAL
+#   refs      -> human S/W references for VAL (for BERTScore)
+#   evalsw    -> BERTScore best-match (ZS vs FT)
+#   evalrate  -> regression metrics (Baselines, ZS raw/cal, FT raw/cal)
+#   plot      -> simple comparison plots
+#   all       -> run everything
 # ======================================================
 
-import os, json, pathlib, platform, random, re, argparse, math, sys
-from typing import Dict, Any, Optional, Tuple, List
+import os, re, json, math, random, platform, argparse, pathlib
 from datetime import datetime
+from typing import Dict, Any, List, Tuple, Optional
+
 import numpy as np
 import pandas as pd
 
+# ---------- Paths & Globals ----------
 SEED = 42
 ROOT = pathlib.Path(".").resolve()
 DATA_DIR = ROOT / "data"
 RESULTS_DIR = ROOT / "results"
 MODEL_DIR = ROOT / "model"
-for d in (DATA_DIR, RESULTS_DIR, MODEL_DIR): d.mkdir(exist_ok=True, parents=True)
+for d in (DATA_DIR, RESULTS_DIR, MODEL_DIR): d.mkdir(parents=True, exist_ok=True)
 
 BASE_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
-MAX_LENGTH = 512
+MAX_LEN = 1024
 
-# -------------------------
-# Repro + tiny env report
-# -------------------------
+# ---------- Repro & Env ----------
 def set_seed(seed: int = SEED):
     import torch
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -40,61 +55,23 @@ def env_report():
     }
     (RESULTS_DIR / "env_report.json").write_text(json.dumps(rpt, indent=2), encoding="utf-8")
 
-# -------------------------
-# Prompting
-# -------------------------
+# ---------- Prompting ----------
 SYSTEM_PROMPT = (
     "You are a peer-review assistant. Return ONLY valid JSON with EXACTLY these keys:\n"
-    "- strengths: list of exactly 3 short strings\n"
-    "- weaknesses: list of exactly 3 short strings\n"
+    "- strengths: list of up to 3 short strings\n"
+    "- weaknesses: list of up to 3 short strings\n"
     "- rate: number (decimal in [1,10])\n"
     "Rules:\n"
-    "1) Output JSON only (no prose, no code fences). Begin with '{' and end with '}'.\n"
-    "2) Use the full 1–10 scale; avoid clustering around 7–8.\n"
-    "3) Base the rate on novelty, methodological soundness, and evaluation strength.\n"
+    "1) Output JSON only (no prose, no code fences).\n"
+    "2) Be specific; avoid vague adjectives.\n"
 )
 
-# Deterministic evidence cues from abstract: reduce mode collapse
-_re_pct = re.compile(r'(\d{1,2}\.?\d?)\s?%')
-DATASET_WORDS = ["imagenet","cifar","mnist","glue","squad","ms coco","libri","wmt","wikitext",
-                 "benchmarks","dataset","datasets","real-world","ablation","user study","human study"]
-EVAL_WORDS = ["state-of-the-art","sota","outperform","improve","significant","p<","confidence interval",
-              "baseline","comparison","ablation","metrics","auc","f1","accuracy","precision","recall"]
-
-def extract_evidence_cues(title: str, abstract: str) -> Dict[str, Any]:
-    t = f"{title} {abstract}".lower()
-    datasets = sum(t.count(w) for w in DATASET_WORDS)
-    eval_terms = sum(t.count(w) for w in EVAL_WORDS)
-    pct_imp = [float(x) for x in _re_pct.findall(t)]
-    has_numbers = bool(re.search(r'\b\d+(\.\d+)?\b', t))
-    len_tokens = len(re.findall(r'\w+', abstract))
-    return {
-        "len_tokens": len_tokens,
-        "datasets_hits": int(datasets),
-        "eval_hits": int(eval_terms),
-        "max_pct_mentioned": float(max(pct_imp) if pct_imp else 0.0),
-        "has_numbers": bool(has_numbers),
-    }
-
-def build_prompts(title: str, abstract: str):
-    cues = extract_evidence_cues(title, abstract)
+def build_prompts(title: str, abstract: str) -> Tuple[str, str]:
     user = (
         f"Paper title: {str(title).strip()}\n"
         f"Abstract:\n{str(abstract).strip()}\n\n"
-        "Use this evidence summary (derived deterministically from the abstract):\n"
-        f"- tokens: {cues['len_tokens']}\n"
-        f"- dataset hits: {cues['datasets_hits']}\n"
-        f"- evaluation/benchmark hits: {cues['eval_hits']}\n"
-        f"- max % mentioned: {cues['max_pct_mentioned']}\n"
-        f"- has numeric results: {cues['has_numbers']}\n\n"
-        "Scoring rubric:\n"
-        "9–10: clear novelty + solid methodology + strong empirical evidence across datasets;\n"
-        "7–8: meaningful contribution + sound methods + decent evaluation;\n"
-        "5–6: incremental or partial; limited or mixed evaluation;\n"
-        "3–4: weak novelty or weak empirical support;\n"
-        "1–2: unclear or flawed.\n"
-        "Return STRICT JSON with keys strengths[3], weaknesses[3], rate (decimal 1–10). "
-        "JSON only. No prose. No code fences."
+        "Task: From title+abstract only, predict likely Strengths, Weaknesses, and a numeric rate [1,10]\n"
+        "that a human reviewer would give. Return STRICT JSON with keys 'strengths' (<=3), 'weaknesses' (<=3), 'rate' (decimal)."
     )
     return SYSTEM_PROMPT, user
 
@@ -102,493 +79,585 @@ def to_chat_prompt_with_template(tokenizer, system: str, user: str) -> str:
     messages = [{"role":"system","content":system},{"role":"user","content":user}]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-# -------------------------
-# JSON helpers
-# -------------------------
-def _to_float(val) -> Optional[float]:
-    if isinstance(val, (int, float)): return float(val)
-    if isinstance(val, str):
-        m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", val.strip())
-        if m:
-            try: return float(m.group(0))
-            except: return None
-    return None
+# ---------- Cleaning & Target Extraction ----------
+_WS = re.compile(r"\s+")
+_SEC_HDR = re.compile(r"^\s*(review|summary|overview|strengths?|pros|advantages?|weaknesses?|cons|limitations?|comments?|questions?)\s*[:\-–#]*\s*$", re.I)
+_MD_BULLET = re.compile(r"^\s*([\-\*\•]|\d{1,2}\.)\s+")
+_URL = re.compile(r"https?://\S+")
+_BRACKETS = re.compile(r"\[[^\]]{0,120}\]|\([^)]{0,120}\)")
+_CONTRAST = re.compile(r"\b(however|but|though|nevertheless|yet|nonetheless|albeit)\b", re.I)
+_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
-def _decode_last_json(txt: str) -> Dict[str, Any]:
-    txt = (txt or "").strip()
-    # keep after last assistant marker if present
-    for sep in ["\nAssistant:", "\nUser:", "\n</s>"]:
-        if sep in txt: txt = txt.split(sep)[-1]
-    # trim to last closing brace
-    if txt.count("{") and txt.count("}"): txt = txt[:txt.rfind("}")+1]
-    last = None
-    for m in re.finditer(r"\{.*?\}", txt, flags=re.S):
-        s = m.group(0)
-        try:
-            last = json.loads(s)
-        except: pass
-    if last is None:
-        return {"strengths":["","",""], "weaknesses":["","",""], "rate": np.nan}
-    st = last.get("strengths", [])
-    wk = last.get("weaknesses", [])
-    st = [str(x).strip() for x in (st if isinstance(st,list) else [st])]
-    wk = [str(x).strip() for x in (wk if isinstance(wk,list) else [wk])]
-    out = {
-        "strengths": (st + [""]*3)[:3],
-        "weaknesses": (wk + [""]*3)[:3],
-        "rate": np.nan
-    }
-    for k in ["rate","rating","score","overall","overall_rating"]:
-        r = _to_float(last.get(k, None))
-        if r is not None:
-            out["rate"] = float(min(10.0, max(1.0, round(float(r), 1))))
-            break
+_POS = [
+    r"\bnovel(ty)?\b", r"\bstrong\b", r"\bclear(?!ly\s*not)\b", r"\bsound\b", r"\bthorough\b",
+    r"\brigor(ous)?\b", r"\binsight(ful)?\b", r"\buseful\b", r"\bsignificant\b", r"\bwell[-\s]?written\b"
+]
+_NEG = [
+    r"\bweak(ness)?\b", r"\blimitation(s)?\b", r"\bconcern(s)?\b", r"\bissue(s)?\b", r"\bflaw(s)?\b",
+    r"\bunclear\b", r"\bnot\s+clear\b", r"\bmissing\b", r"\binsufficient\b", r"\berror(s)?\b", r"\bbias(ed)?\b",
+    r"\bconfound(ing)?\b", r"\black(s)?\b", r"\bno(t)?\s+evidence\b"
+]
+_POS_RE = re.compile("|".join(_POS), re.I)
+_NEG_RE = re.compile("|".join(_NEG), re.I)
+_GENERIC_STR = re.compile(
+    r"^\s*(?:the|this|a|an)?\s*(?:paper)?\s*(?:is|was|'s)?\s*"
+    r"(?:interesting|good|nice|well[-\s]?written|well[-\s]?presented|well[-\s]?described)\b",
+    re.I
+)
+
+def _clean_abstract(a: str) -> str:
+    """Pulisce 'Abstract:###', eventuali '###', URL, spazi."""
+    a = str(a or "")
+    if a.startswith("Abstract:###"):
+        a = a[len("Abstract:###"):]
+    a = a.replace("Abstract:###", " ")
+    a = a.replace("###", " ")
+    a = _URL.sub(" ", a)
+    a = _WS.sub(" ", a).strip()
+    return a
+
+def _strip_review_prefix(s: str) -> str:
+    """Rimuove solo prefissi 'Review:###'/'###' e normalizza spazi; NON elimina header utili."""
+    t = str(s or "")
+    if t.startswith("Review:###"):
+        t = t[len("Review:###"):]
+    t = t.replace("Review:###", " ")
+    t = t.replace("###", " ")
+    return _WS.sub(" ", t).strip()
+
+def _preclean_review(text: str) -> str:
+    """Pulizia aggressiva per il fallback di polarità (usata dentro l'estrattore)."""
+    t = str(text or "")
+    if t.startswith("Review:###"):
+        t = t[len("Review:###"):]
+    t = t.replace("Review:###", " ").replace("###", " ")
+    t = _URL.sub(" ", t)
+    out = []
+    for ln in t.splitlines():
+        ln = _MD_BULLET.sub("", ln).strip()
+        if _SEC_HDR.match(ln):  # salta header
+            continue
+        out.append(ln)
+    t = " ".join(out)
+    t = _BRACKETS.sub(" ", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
+def _split_sentences_and_clauses(t: str) -> List[str]:
+    sents = []
+    for s in _SENT_SPLIT.split(t):
+        s = s.strip()
+        if not s: continue
+        if _CONTRAST.search(s):
+            parts = re.split(_CONTRAST, s)
+            for p in parts:
+                p = p.strip(" ,;:—-")
+                if 10 <= len(p) <= 280: sents.append(p)
+        else:
+            if 10 <= len(s) <= 280: sents.append(s)
+    return sents[:120]
+
+def _score_polarity(s: str) -> Tuple[int,int]:
+    pos = len(_POS_RE.findall(s))
+    neg = len(_NEG_RE.findall(s))
+    if "?" in s: neg += 1
+    if pos > 0 and neg > 0: neg += 1
+    return pos, neg
+
+def _diverse_topk(cands: List[str], k=3) -> List[str]:
+    if not cands: return []
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        vec = TfidfVectorizer(ngram_range=(1,2), min_df=1)
+        X = vec.fit_transform(cands)
+        keep = []
+        for i in range(len(cands)):
+            if not keep: keep.append(i); continue
+            sim = cosine_similarity(X[i], X[keep]).max()
+            if sim < 0.75: keep.append(i)
+            if len(keep) >= k: break
+        return [cands[i] for i in keep][:k]
+    except Exception:
+        out, seen = [], set()
+        for s in cands:
+            if s not in seen:
+                out.append(s); seen.add(s)
+            if len(out) >= k: break
+        return out
+
+def _section_parse(review_text: str) -> Dict[str, List[str]]:
+    lines = [l.strip() for l in (review_text or "").splitlines()]
+    sections = {}
+    current = None
+    for ln in lines:
+        if re.match(r"^\s*(strengths?|pros|advantages?)\s*[:\-\-#]*\s*$", ln, re.I): current = "S"; continue
+        if re.match(r"^\s*(weakness(es)?|cons|limitations?)\s*[:\-\-#]*\s*$", ln, re.I): current = "W"; continue
+        if re.match(r"^\s*(summary|overview|review|comments?|questions?)\s*[:\-\-#]*\s*$", ln, re.I): current = None; continue
+        if not ln: continue
+        if current:
+            ln = _MD_BULLET.sub("", ln)
+            ln = _BRACKETS.sub(" ", ln)
+            ln = _URL.sub(" ", ln)
+            ln = _WS.sub(" ", ln).strip()
+            sections.setdefault(current, []).append(ln)
+    out = {"S": sections.get("S", []), "W": sections.get("W", [])}
     return out
 
-# Heuristic fallback when JSON has NaN rate
-def _heuristic_rate_from_cues(cues: Dict[str, Any]) -> float:
-    score = 4.0
-    score += min(3.0, cues["datasets_hits"] * 0.6)
-    score += min(2.0, cues["eval_hits"] * 0.4)
-    score += 0.6 if cues["has_numbers"] else 0.0
-    score += min(1.0, max(0, (cues["max_pct_mentioned"] - 2.0) / 10.0))
-    score += min(0.8, max(0, (cues["len_tokens"] - 120) / 400.0))
-    return float(max(1.0, min(10.0, round(score, 1))))
+def extract_sw_from_review(review_text: str, k=3) -> Dict[str, List[str]]:
+    sec = _section_parse(review_text)
+    S_sec = [s for s in sec["S"] if 10 <= len(s) <= 280 and not _GENERIC_STR.match(s)]
+    W_sec = [s for s in sec["W"] if 10 <= len(s) <= 280]
+    if S_sec or W_sec:
+        S = _diverse_topk(S_sec, k)
+        W = _diverse_topk(W_sec, k)
+        return {"strengths": S, "weaknesses": W}
 
-# -------------------------
-# Data: PREPARE
-# -------------------------
-def step_prepare(x_path: pathlib.Path):
-    if x_path.suffix.lower() == ".csv": df = pd.read_csv(x_path)
-    else: df = pd.read_excel(x_path)
-    df.columns = [c.strip() for c in df.columns]
-    needed = ["title", "abstract", "review", "rate"]
-    miss = [c for c in needed if c not in df.columns]
-    assert not miss, f"Missing columns: {miss}"
-    df = df.dropna(subset=["title","abstract","review"]).copy()
-    df["abstract"] = df["abstract"].astype(str).str.replace("Abstract:###","",regex=False).str.strip()
-    grp = df.groupby("title", as_index=False).agg(
-        abstract=("abstract","first"),
-        review=("review", lambda s: "\n\n".join(map(str, s))),
-        rate_mean=("rate", lambda s: pd.to_numeric(s, errors="coerce").mean())
-    )
-    usable = grp.dropna(subset=["rate_mean"]).copy()
-    from sklearn.model_selection import train_test_split
-    train_df, val_df = train_test_split(usable, test_size=0.2, random_state=SEED, shuffle=True)
-    train_df.to_csv(DATA_DIR / "train_clean.csv", index=False)
-    val_df.to_csv(DATA_DIR / "val_clean.csv", index=False)
-    grp.to_csv(DATA_DIR / "all_clean.csv", index=False)
-    print(f"[prepare] train={len(train_df)} val={len(val_df)} saved")
-
-# -------------------------
-# Model load
-# -------------------------
-def load_model_and_tokenizer():
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    has_cuda = torch.cuda.is_available()
-    has_mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
-    tok = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True, trust_remote_code=False)
-    if tok.pad_token is None: tok.pad_token = tok.eos_token
-    tok.padding_side = "left"
-    use_4bit = False
-    try:
-        import importlib.metadata as im
-        _ = im.version("bitsandbytes"); use_4bit = True
-    except Exception: use_4bit = False
-    if use_4bit:
-        from transformers import BitsAndBytesConfig
-        bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                                 bnb_4bit_compute_dtype=torch.bfloat16 if has_cuda else torch.float16)
-        mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, quantization_config=bnb,
-                                                   device_map="auto", trust_remote_code=False)
-        return tok, mdl
-    if has_cuda: dtype = torch.float16; device_map = "auto"
-    elif has_mps: dtype = torch.float16; device_map = {"": "mps"}
-    else: dtype = torch.float32; device_map = "cpu"
-    mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=dtype,
-                                               device_map=device_map, low_cpu_mem_usage=True,
-                                               trust_remote_code=False)
-    return tok, mdl
-
-# -------------------------
-# Generation
-# -------------------------
-def generate_structured_json(tokenizer, model, title, abstract,
-                             max_new_tokens=220, attempts=4, allow_fallback=True):
-    import torch, time
-    cues = extract_evidence_cues(title, abstract)
-    sys, usr = build_prompts(title, abstract)
-
-    def _gen(do_sample: bool):
-        prompt = to_chat_prompt_with_template(tokenizer, sys, usr)
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        gen_kwargs = dict(max_new_tokens=max_new_tokens,
-                          pad_token_id=tokenizer.eos_token_id,
-                          use_cache=True)
-        if do_sample:
-            gen_kwargs.update(dict(do_sample=True, temperature=0.7, top_p=0.9,
-                                   repetition_penalty=1.1))
+    t = _preclean_review(review_text)
+    sents = _split_sentences_and_clauses(t)
+    pos_cand, neg_cand = [], []
+    for s in sents:
+        if _GENERIC_STR.match(s):  # drop generic praise
+            continue
+        pos, neg = _score_polarity(s)
+        if pos==0 and neg==0: continue
+        if neg > pos or "?" in s:
+            neg_cand.append((neg - pos + (1 if "?" in s else 0), s))
         else:
-            gen_kwargs.update(dict(do_sample=False))  # no temp/top_p warnings
-        with torch.no_grad():
-            out = model.generate(**inputs, **gen_kwargs)
-        txt = tokenizer.decode(out[0], skip_special_tokens=True)
-        return _decode_last_json(txt)
+            pos_cand.append((pos - neg, s))
+    pos_cand.sort(key=lambda x: (-x[0], len(x[1])))
+    neg_cand.sort(key=lambda x: (-x[0], len(x[1])))
+    S = _diverse_topk([s for _,s in pos_cand][:10], k)
+    W = _diverse_topk([s for _,s in neg_cand][:10], k)
+    return {"strengths": S, "weaknesses": W}
 
-    best = None
-    for i in range(attempts):
-        obj = _gen(do_sample=(i % 2 == 1))
-        if (obj.get("rate") == obj.get("rate")) and any(obj["strengths"]) and any(obj["weaknesses"]):
-            best = obj; break
-        best = obj
+# =========================
+# --------- RATING --------
+# =========================
 
-    if best is None:
-        best = {"strengths":["","",""], "weaknesses":["","",""], "rate": np.nan}
+def _norm_title(t: str) -> str:
+    return _WS.sub(" ", str(t or "").strip()).lower()
 
-    # Fallback: never hardcode 6.0; derive from evidence cues
-    if (best.get("rate") != best.get("rate")) or (best.get("rate") is None):
-        if allow_fallback:
-            best["rate"] = _heuristic_rate_from_cues(cues)
+_RATE_MIN, _RATE_MAX = 1.0, 10.0
 
-    # Always keep lists non-empty
-    best["strengths"]  = [(s or "clear contribution") for s in (best.get("strengths",["","",""]) + [""]*3)[:3]]
-    best["weaknesses"] = [(w or "limited evaluation") for w in (best.get("weaknesses",["","",""]) + [""]*3)[:3]]
-    return best
+def _norm_decimal_str(s: str) -> str:
+    s = str(s).strip().replace("\u00A0"," ").replace("\u2009"," ")
+    return s.replace(",", ".")
 
-# -------------------------
-# Distillation / Datasets / LoRA (unchanged logic)
-# -------------------------
-def step_distill_structured(limit: Optional[int] = None):
-    set_seed(); tok, mdl = load_model_and_tokenizer()
-    train_df = pd.read_csv(DATA_DIR / "train_clean.csv")
-    val_df = pd.read_csv(DATA_DIR / "val_clean.csv")
-    if limit: train_df = train_df.head(limit); val_df = val_df.head(max(1, limit // 5))
-    def _run(df_in: pd.DataFrame, name: str):
-        rows = []
-        for _, r in df_in.iterrows():
-            obj = generate_structured_json(tok, mdl, r["title"], r["abstract"], allow_fallback=True)
-            rows.append({
-                "title": r["title"],
-                "abstract": r["abstract"],
-                "review_structured": json.dumps(obj, ensure_ascii=False),
-                "rate_gen": obj["rate"],
-                "rate_mean": r.get("rate_mean", np.nan),
-            })
-        pd.DataFrame(rows).to_csv(DATA_DIR / f"{name}_structured.csv", index=False)
-    _run(train_df, "train"); _run(val_df, "val")
-    print("[distill] train_structured.csv / val_structured.csv")
+def _parse_rate_value(raw) -> Optional[float]:
+    """Accetta '7', '7,5', '8/10', '85/100', 'score: 7.0/10' ecc. Clippa su [1,10]."""
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)): return None
+    txt = _norm_decimal_str(raw)
+    if not txt or txt.lower() in {"na","n/a","nan","none","-"}: return None
 
+    m = re.search(r'(\d+(?:\.\d+)?)\s*/\s*(\d+)', txt)
+    if m:
+        num = float(m.group(1)); den = float(m.group(2))
+        if den > 0:
+            val = num * (10.0/den)
+            return float(min(_RATE_MAX, max(_RATE_MIN, val)))
+
+    m = re.search(r'(?<!\d)(\d+(?:\.\d+)?)(?!/)', txt)
+    if m:
+        val = float(m.group(1))
+        return float(min(_RATE_MAX, max(_RATE_MIN, val)))
+    return None
+
+# mapping etichette testuali comuni
+_TEXT_RATING_MAP = [
+    (r"\bstrong\s+accept\b", 9.5),
+    (r"\baccept\b",          8.0),
+    (r"\bweak\s+accept\b",   7.0),
+    (r"\bborderline\b",      6.0),
+    (r"\bweak\s+reject\b",   4.5),
+    (r"\breject\b",          3.0),
+    (r"\bstrong\s+reject\b", 1.5),
+]
+
+def _parse_textual_label_as_rate(txt: str) -> Optional[float]:
+    if not isinstance(txt, str) or not txt.strip(): return None
+    s = txt.lower()
+    for pat, val in _TEXT_RATING_MAP:
+        if re.search(pat, s, flags=re.I):
+            return float(val)
+    return None
+
+# pattern numerici nel testo review
+_RATE_PATTERNS_REVIEW = [
+    r"\b(rating|rate|overall|score|recommendation)\s*[:=\-]\s*(\d+(?:[\.,]\d+)?)\b",
+    r"\b(\d+(?:[\.,]\d+)?)\s*/\s*(10|100)\b",
+]
+
+def _parse_rate_from_review_text(txt: str) -> Optional[float]:
+    if not isinstance(txt, str) or not txt.strip(): return None
+    s = _norm_decimal_str(txt.lower())
+    for pat in _RATE_PATTERNS_REVIEW:
+        m = re.search(pat, s, flags=re.I)
+        if not m: continue
+        groups = [g for g in m.groups() if g is not None]
+        nums, den = [], None
+        for g in groups:
+            g2 = g.strip()
+            if re.fullmatch(r"\d+(?:\.\d+)?", g2): nums.append(float(g2))
+            if g2 in {"10","100"}: den = int(g2)
+        if nums:
+            val = nums[-1]
+            if den == 100: val = val/10.0
+            return float(min(_RATE_MAX, max(_RATE_MIN, val)))
+    return None
+
+# ---- SPECIFICO: colonna 'paper_score' come "Rating:###6: Weak Accept"
+def _parse_rate_from_paper_score(cell) -> Optional[float]:
+    if cell is None or (isinstance(cell, float) and np.isnan(cell)): return None
+    s = str(cell)
+    # rimuovi "Rating:###" e normalizza separatori tipo ":" o "-"
+    s = s.replace("Rating:###", " ").replace("###", " ")
+    s = _norm_decimal_str(s)
+    # 1) prova numero esplicito
+    num = _parse_rate_value(s)
+    if num is not None:
+        return num
+    # 2) fallback: mappa etichetta testuale (Weak Accept ecc.)
+    lab = _parse_textual_label_as_rate(s)
+    return lab
+
+def _find_rate_columns(columns):
+    cols = [c for c in columns]
+    low = [c.lower().strip() for c in columns]
+    cand_keys = {"rate","rating","overall","recommendation","score","final rating","meta rating","paper_score"}
+    picks = []
+    for i, c in enumerate(low):
+        if any(k == c or re.search(rf"\b{k}\b", c) for k in cand_keys):
+            if "confidence" in c:
+                continue
+            picks.append(cols[i])
+    seen=set(); out=[]
+    for c in picks:
+        if c not in seen:
+            seen.add(c); out.append(c)
+    return out
+
+# ====================================================
+# ----------------- PREPARE STEP ---------------------
+# ====================================================
+def step_prepare(x_path: pathlib.Path):
+    # 1) leggi
+    if x_path.suffix.lower() == ".csv":
+        df = pd.read_csv(x_path)
+    else:
+        df = pd.read_excel(x_path, engine="openpyxl")
+    df.columns = [c.strip() for c in df.columns]
+
+    needed = ["title","abstract","review"]
+    miss = [c for c in needed if c not in df.columns]
+    assert not miss, f"Mancano colonne: {miss}"
+
+    # 2) pulizia testi base
+    df = df.dropna(subset=["title","abstract","review"]).copy()
+    df["abstract"] = df["abstract"].map(_clean_abstract)
+    df["review"]   = df["review"].map(lambda x: _strip_review_prefix(x) if isinstance(x,str) else str(x))
+
+    # 3) chiave normalizzata per il groupby
+    df["title_key"] = df["title"].map(_norm_title)
+
+    # 4) individua tutte le colonne rating (inclusa 'paper_score')
+    rate_cols = _find_rate_columns(df.columns)
+    assert rate_cols, "Nessuna colonna di rating trovata (rate/rating/overall/score/paper_score/...)."
+    print(f"[prepare] Colonne rating candidate: {rate_cols}")
+
+    # 5) parsing per colonna + parsing specifico 'paper_score'
+    parsed_cols = {}
+    for c in rate_cols:
+        if c.strip().lower() == "paper_score":
+            parsed = df[c].apply(_parse_rate_from_paper_score).astype(float)
+        else:
+            parsed = df[c].apply(_parse_rate_value).astype(float)
+        parsed_cols[c] = parsed
+
+    # coverage per colonna
+    src_cov = {c: (~s.isna()).mean() for c, s in parsed_cols.items()}
+    print("[prepare] Coverage per colonna:", {k: f"{v:.1%}" for k,v in src_cov.items()})
+
+    # 6) fusione: prendi il primo valore disponibile nell'ordine di rate_cols
+    def _fuse_row(idx):
+        for c in rate_cols:
+            v = parsed_cols[c].iat[idx]
+            if not (v is None or (isinstance(v,float) and np.isnan(v))):
+                return float(v)
+        # fallback dal testo review: numero esplicito
+        v = _parse_rate_from_review_text(df["review"].iat[idx])
+        if v is not None: return float(v)
+        # fallback da etichetta testuale
+        v = _parse_textual_label_as_rate(df["review"].iat[idx])
+        if v is not None: return float(v)
+        return np.nan
+
+    df["rate_num_fused"] = [ _fuse_row(i) for i in range(len(df)) ]
+    cov_fused = (~pd.Series(df["rate_num_fused"]).isna()).mean()
+    print(f"[prepare] Coverage rate (fusione colonne + review + label): {cov_fused:.1%}")
+
+    # esempi falliti (celle presenti ma non parsate)
+    any_raw = df[rate_cols].apply(lambda x: x.astype(str).str.strip().str.len()>0, axis=0).any(axis=1)
+    bad = df[any_raw & pd.Series(df["rate_num_fused"]).isna()]
+    if len(bad) > 0:
+        cols_to_dump = ["title","paper_score","review"] if "paper_score" in df.columns else ["title","review"]
+        (bad[cols_to_dump].head(50)).to_csv(RESULTS_DIR/"rate_parse_fail_examples.csv", index=False)
+        print("[prepare] esempi non parsati → results/rate_parse_fail_examples.csv")
+
+    # 7) aggregazione per titolo
+    grp = (df
+        .sort_values(["title_key"])
+        .groupby("title_key", as_index=False)
+        .agg(
+            title      = ("title","first"),
+            abstract   = ("abstract","first"),
+            review     = ("review", lambda s: "\n\n".join(map(str, s))),
+            rate_mean  = ("rate_num_fused","mean"),
+            n_reviews  = ("review","size"),
+            n_rated    = ("rate_num_fused", lambda s: (~pd.Series(s).isna()).sum())
+        )
+    )
+
+    # 8) split
+    from sklearn.model_selection import train_test_split
+    train_df, val_df = train_test_split(grp, test_size=0.2, random_state=SEED, shuffle=True)
+    train_df.to_csv(DATA_DIR/"train_clean.csv", index=False)
+    val_df.to_csv(DATA_DIR/"val_clean.csv", index=False)
+
+    cov_train = (~train_df["rate_mean"].isna()).mean()
+    cov_val   = (~val_df["rate_mean"].isna()).mean()
+    print(f"[prepare] train={len(train_df)} val={len(val_df)} | coverage rate_mean: train={cov_train:.1%} val={cov_val:.1%}")
+
+    # 9) diagnostica titoli senza alcun voto numerico
+    gap = (grp[(grp["n_reviews"]>0) & (grp["n_rated"]==0)]
+           .sort_values("n_reviews", ascending=False))
+    if len(gap):
+        gap[["title","n_reviews","n_rated"]].to_csv(RESULTS_DIR/"titles_no_numeric_rate.csv", index=False)
+        print(f"[prepare] {len(gap)} titoli senza alcun voto numerico → results/titles_no_numeric_rate.csv")
+
+# ---------- Supervised Targets (TRAIN & VAL) ----------
+def step_make_supervised_targets(src_csv: pathlib.Path, out_csv: pathlib.Path, k=3, is_train=False):
+    df = pd.read_csv(src_csv)
+    rows = []
+    for _, r in df.iterrows():
+        sw = extract_sw_from_review(str(r["review"]), k=k)
+        rate = r.get("rate_mean", np.nan)
+        rate = float(rate) if pd.notna(rate) else np.nan
+
+        if is_train and np.isnan(rate):
+            continue
+
+        tgt = {
+            "strengths": (sw["strengths"] + [""]*k)[:k],
+            "weaknesses": (sw["weaknesses"] + [""]*k)[:k],
+            "rate": None if np.isnan(rate) else float(round(min(10.0, max(1.0, rate)), 2))
+        }
+        rows.append({
+            "title": r["title"],
+            "abstract": r["abstract"],
+            "rate_mean": None if np.isnan(rate) else float(rate),
+            "target_json": json.dumps(tgt, ensure_ascii=False)
+        })
+    out = pd.DataFrame(rows)
+    out.to_csv(out_csv, index=False)
+    print(f"[sup] {out_csv} saved (rows kept: {len(out)})")
+
+# ---------- Datasets & LoRA ----------
 def build_hf_datasets():
     from datasets import Dataset
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True, trust_remote_code=False)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = "left"
-    def _to_hf(df: pd.DataFrame):
+
+    train_sup = pd.read_csv(DATA_DIR / "train_supervised.csv")
+    val_sup   = pd.read_csv(DATA_DIR / "val_supervised.csv")
+
+    def _to_hf(df):
         prompts, responses = [], []
         for _, r in df.iterrows():
             sys, usr = build_prompts(r["title"], r["abstract"])
             prompts.append(to_chat_prompt_with_template(tok, sys, usr))
-            responses.append(r["review_structured"])
+            responses.append(r["target_json"])
         return Dataset.from_dict({"prompt": prompts, "response": responses})
-    tr = _to_hf(pd.read_csv(DATA_DIR / "train_structured.csv"))
-    va = _to_hf(pd.read_csv(DATA_DIR / "val_structured.csv"))
+
+    tr = _to_hf(train_sup); va = _to_hf(val_sup)
+
     def tokenize(example):
-        text = example["prompt"] + example["response"]
-        toks = tok(text, truncation=True, padding="max_length", max_length=MAX_LENGTH)
-        toks["labels"] = toks["input_ids"].copy()
-        return toks
+        prompt_ids = tok(example["prompt"], add_special_tokens=False).input_ids
+        resp_ids   = tok(example["response"], add_special_tokens=False).input_ids
+        input_ids = (prompt_ids + resp_ids)[:MAX_LEN]
+        labels    = ([-100]*len(prompt_ids) + resp_ids)[:MAX_LEN]
+        attn      = [1]*len(input_ids)
+        return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
+
     tr_tok = tr.map(tokenize, remove_columns=tr.column_names)
     va_tok = va.map(tokenize, remove_columns=va.column_names)
     tr_tok.save_to_disk(str(DATA_DIR / "train_tokenized"))
     va_tok.save_to_disk(str(DATA_DIR / "val_tokenized"))
     print("[buildds] tokenized datasets saved")
 
-def step_finetune_lora():
-    import json, torch
+def finetune_lora():
+    import torch
     from datasets import load_from_disk
     from transformers import (AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer,
                               DataCollatorForLanguageModeling, BitsAndBytesConfig)
     from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
     set_seed()
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA non disponibile per 4-bit.")
-    try:
-        import bitsandbytes as _bnb  # noqa: F401
-    except Exception as e:
-        raise RuntimeError("Installa bitsandbytes==0.43.1 e triton compatibile.") from e
-    bf16_ok = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
-    compute_dtype = torch.bfloat16 if bf16_ok else torch.float16
+        raise RuntimeError("CUDA required for 4-bit LoRA training.")
+
     tok = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True, trust_remote_code=False)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = "left"
+
+    bf16_ok = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+    compute_dtype = torch.bfloat16 if bf16_ok else torch.float16
     bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                                  bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=compute_dtype)
+
     base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, quantization_config=bnb_cfg,
                                                 device_map="auto", trust_remote_code=False)
     base = prepare_model_for_kbit_training(base)
-    if hasattr(base,"config"): base.config.use_cache = False
-    if hasattr(base,"enable_input_require_grads"): base.enable_input_require_grads()
-    lora_cfg = LoraConfig(r=8, lora_alpha=16, lora_dropout=0.05, bias="none",
-                          target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-                          task_type="CAUSAL_LM")
+    if hasattr(base, "config"): base.config.use_cache = False
+    if hasattr(base, "enable_input_require_grads"): base.enable_input_require_grads()
+
+    lora_cfg = LoraConfig(
+        r=8, lora_alpha=16, lora_dropout=0.05, bias="none",
+        target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+        task_type="CAUSAL_LM"
+    )
     model = get_peft_model(base, lora_cfg)
+
+    from datasets import load_from_disk
     tr = load_from_disk(str(DATA_DIR / "train_tokenized"))
     va = load_from_disk(str(DATA_DIR / "val_tokenized"))
+    from transformers import DataCollatorForLanguageModeling
     coll = DataCollatorForLanguageModeling(tokenizer=tok, mlm=False)
+
+    from transformers import EarlyStoppingCallback
     args = TrainingArguments(
-        output_dir=str(MODEL_DIR / "finetuned-llama3"), remove_unused_columns=False,
-        per_device_train_batch_size=1, per_device_eval_batch_size=1, gradient_accumulation_steps=8,
-        eval_strategy="steps", save_strategy="steps", logging_steps=25, eval_steps=100, save_steps=100,
+        output_dir=str(MODEL_DIR / "finetuned-llama3"),
+        remove_unused_columns=False,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=8,
+        eval_strategy="steps", save_strategy="steps",
+        logging_steps=25, eval_steps=100, save_steps=100,
         num_train_epochs=3, learning_rate=2e-5, warmup_ratio=0.05,
         bf16=bf16_ok, fp16=not bf16_ok, gradient_checkpointing=True,
-        report_to=[], load_best_model_at_end=True, metric_for_best_model="eval_loss", greater_is_better=False,
+        report_to=[], load_best_model_at_end=True,
+        metric_for_best_model="eval_loss", greater_is_better=False,
     )
-    from transformers import EarlyStoppingCallback
     trainer = Trainer(model=model, args=args, data_collator=coll,
                       train_dataset=tr, eval_dataset=va, tokenizer=tok,
                       callbacks=[EarlyStoppingCallback(early_stopping_patience=3)])
-    out = trainer.train()
-    (RESULTS_DIR / "trainer_log.json").write_text(json.dumps({"train_metrics": out.metrics}, indent=2), encoding="utf-8")
-    print("[finetune] done; best checkpoint under model/finetuned-llama3")
+    trainer.train()
+    model.save_pretrained(str(MODEL_DIR / "finetuned-llama3"))
+    print("[finetune] done; adapters under model/finetuned-llama3")
 
-# -------------------------
-# Baselines + CI
-# -------------------------
-def _rmse(y_true, y_pred):
-    from sklearn.metrics import mean_squared_error
-    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+# ---------- Generation (ZS & FT) ----------
+GEN_KW = dict(max_new_tokens=220, do_sample=True, temperature=0.7, top_p=0.9)
+_NUM_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
-def _bootstrap_ci(metric_fn, y_true, y_pred, n_boot=2000, alpha=0.05):
-    rng = np.random.default_rng(SEED)
-    yt, yp = np.array(y_true), np.array(y_pred); n = len(yt)
-    vals = []
-    for _ in range(n_boot):
-        idx = rng.integers(0, n, n)
-        vals.append(metric_fn(yt[idx], yp[idx]))
-    lo, hi = np.quantile(vals, [alpha/2, 1-alpha/2])
-    return float(lo), float(hi)
+def _to_float(val) -> Optional[float]:
+    if isinstance(val, (int, float)): return float(val)
+    if isinstance(val, str):
+        m = _NUM_RE.search(val.strip())
+        if m:
+            try: return float(m.group(0))
+            except: return None
+    return None
 
-def _eval_reg(y_true, y_pred):
-    from sklearn.metrics import mean_absolute_error, r2_score
-    from scipy.stats import pearsonr
-    return {
-        "MAE": float(mean_absolute_error(y_true, y_pred)),
-        "RMSE": _rmse(y_true, y_pred),
-        "R2": float(r2_score(y_true, y_pred)),
-        "Pearson": float(pearsonr(y_true, y_pred)[0]),
-    }
+def _decode_last_json(text: str) -> Dict[str, Any]:
+    txt = (text or "").strip()
+    if txt.count("{") and txt.count("}"): txt = txt[:txt.rfind("}")+1]
+    last = None
+    for m in re.finditer(r"\{.*?\}", txt, flags=re.S):
+        s = m.group(0)
+        try: last = json.loads(s)
+        except: pass
+    if last is None: return {"strengths": [], "weaknesses": [], "rate": None}
+    S = last.get("strengths", []); W = last.get("weaknesses", []); R = last.get("rate", None)
+    S = [str(x).strip() for x in (S if isinstance(S, list) else [S])]
+    W = [str(x).strip() for x in (W if isinstance(W, list) else [W])]
+    r = _to_float(R)
+    if r is not None: r = float(min(10.0, max(1.0, round(r, 2))))
+    return {"strengths": [s for s in S if s][:3], "weaknesses": [w for w in W if w][:3], "rate": r}
 
-def step_baselines_and_ci():
-    from sklearn.linear_model import LinearRegression
-    val_df = pd.read_csv(DATA_DIR / "val_clean.csv")
-    train_df = pd.read_csv(DATA_DIR / "train_clean.csv")
-    y_rate = val_df["rate_mean"].tolist()
-    mean_pred = [float(np.mean(train_df["rate_mean"]))] * len(y_rate)
-    Xtr = train_df["abstract"].str.len().to_numpy().reshape(-1,1)
-    Xva = val_df["abstract"].str.len().to_numpy().reshape(-1,1)
-    reg = LinearRegression().fit(Xtr, train_df["rate_mean"])
-    lin_pred = reg.predict(Xva)
-    def with_ci(y, p):
-        m = _eval_reg(y, p); ci = {}
-        for key, fn in [("MAE", lambda a,b: _eval_reg(a,b)["MAE"]),
-                        ("RMSE", lambda a,b: _eval_reg(a,b)["RMSE"])]:
-            lo, hi = _bootstrap_ci(lambda a,b: fn(a,b), np.array(y), np.array(p))
-            ci[f"{key}_CI"] = [lo, hi]
-        return (m, ci)
-    metrics = {
-        "rate_mean_baseline": with_ci(y_rate, mean_pred),
-        "rate_len_linear":    with_ci(y_rate, lin_pred),
-    }
-    (RESULTS_DIR / "baseline_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print("[baselines] baseline_metrics.json saved")
-
-# -------------------------
-# Calibration (robusta)
-# -------------------------
-def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [c.strip().replace("\ufeff","") for c in df.columns]
-    return df
-
-def _fit_rate_calibrator(train_structured_csv: pathlib.Path, train_clean_csv: pathlib.Path):
-    from sklearn.linear_model import HuberRegressor
-    try:
-        tr_s = _normalize_cols(pd.read_csv(train_structured_csv))
-    except Exception:
-        # if structured predictions are missing, return identity
-        return (1.0, 0.0)
-    try:
-        tr_c = _normalize_cols(pd.read_csv(train_clean_csv))
-    except Exception:
-        return (1.0, 0.0)
-
-    # reconstruct rate_mean if absent
-    if "rate_mean" not in tr_c.columns:
-        if "rate" in tr_c.columns:
-            tmp = tr_c.copy()
-            tmp["rate_num"] = pd.to_numeric(tmp["rate"], errors="coerce")
-            # ensure there's a title column to group by
-            if "title" not in tmp.columns:
-                return (1.0, 0.0)
-            tr_c = tmp.groupby("title", as_index=False).agg(rate_mean=("rate_num", "mean"))
-        else:
-            return (1.0, 0.0)
-
-    # ensure structured file has generated rates
-    if "rate_gen" not in tr_s.columns:
-        # try to extract rate_gen from a JSON column if present (robust fallback)
-        if "review_structured" in tr_s.columns:
-            def _extract_rate(x):
-                try:
-                    j = json.loads(x)
-                    r = j.get("rate", None)
-                    return float(r) if r is not None else np.nan
-                except Exception:
-                    return np.nan
-            tr_s["rate_gen"] = tr_s["review_structured"].apply(_extract_rate)
-        else:
-            return (1.0, 0.0)
-
-    # merge on title; bail out if title missing
-    if "title" not in tr_s.columns or "title" not in tr_c.columns:
-        return (1.0, 0.0)
-
-    df = tr_s.merge(tr_c[["title", "rate_mean"]], on="title", how="inner")
-    if "rate_gen" not in df.columns or "rate_mean" not in df.columns:
-        return (1.0, 0.0)
-
-    df = df.dropna(subset=["rate_gen", "rate_mean"]).copy()
-
-    if len(df) < 8:
-        return (1.0, 0.0)  # identity
-
-    x = df["rate_gen"].astype(float).to_numpy().reshape(-1, 1)
-    y = df["rate_mean"].astype(float).to_numpy()
-    reg = HuberRegressor().fit(x, y)
-    # Return (a, b) so that a*pred + b
-    return (float(reg.coef_[0]), float(reg.intercept_))
-
-def _apply_calibration(arr: List[Optional[float]], a: float, b: float):
-    out = []
-    for v in arr:
-        if v is None or (isinstance(v, float) and np.isnan(v)):
-            out.append(None)
-        else:
-            out.append(float(max(1.0, min(10.0, a*float(v) + b))))
-    return out
-
-# -------------------------
-# Zero-shot numeric eval
-# -------------------------
-def step_zero_shot_numeric_eval():
-    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-    from scipy.stats import pearsonr
-    def rmse(y_true, y_pred): 
-        return float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    def eval_reg(y_true, y_pred):
-        return {
-            "MAE": mean_absolute_error(y_true, y_pred),
-            "RMSE": rmse(y_true, y_pred),
-            "R2": r2_score(y_true, y_pred),
-            "Pearson": float(pearsonr(y_true, y_pred)[0])
-        }
-    set_seed()
-    tok, mdl = load_model_and_tokenizer()
-    val_df = pd.read_csv(DATA_DIR / "val_clean.csv")
-    y_rate = val_df["rate_mean"].tolist()
-
-    zs_rate, raw_rows = [], []
-    for _, r in val_df.iterrows():
-        obj = generate_structured_json(tok, mdl, r["title"], r["abstract"], allow_fallback=True)
-        rate = obj["rate"] if obj["rate"] == obj["rate"] else None
-        zs_rate.append(rate)
-        raw_rows.append({"title": r["title"], "parsed_rate": rate, "obj": json.dumps(obj, ensure_ascii=False)})
-
-    pd.DataFrame(raw_rows).to_csv(RESULTS_DIR / "zseval_debug.csv", index=False)
-
-    a, b = _fit_rate_calibrator(DATA_DIR / "train_structured.csv", DATA_DIR / "train_clean.csv")
-    zs_rate_cal = _apply_calibration(zs_rate, a, b)
-
-    yt, yp = [], []
-    for t, p in zip(y_rate, zs_rate_cal):
-        if p is not None and not np.isnan(t):
-            yt.append(t); yp.append(p)
-
-    out = {}
-    if len(yt) > 5:
-        out["rate_zero_shot"] = eval_reg(yt, yp)
-        out["rate_zero_shot_calibration"] = {"a": a, "b": b}
-
-    (RESULTS_DIR / "zs_metrics.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
-    print(f"[zseval] zs_metrics.json saved; usable={len(yt)}/{len(y_rate)}. Debug → results/zseval_debug.csv")
-
-# -------------------------
-# HUMAN S/W refs + eval
-# -------------------------
-_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
-def _split_sents(text: str) -> List[str]:
-    return [s.strip() for s in _SENT_SPLIT.split(text or "") if s.strip()][:50]
-
-def extract_sw_from_review(review_text: str) -> Dict[str, List[str]]:
-    text = (review_text or "").strip()
-    strengths, weaknesses = [], []
-    lines = [l.strip() for l in text.splitlines()]
-    current = None
-    for ln in lines:
-        if re.match(r'^\s*strengths?\s*[:\-–]', ln, re.I): current = "S"; continue
-        if re.match(r'^\s*(weaknesses?|limitations?)\s*[:\-–]', ln, re.I): current = "W"; continue
-        if not ln.strip(): current = None; continue
-        if current == "S": strengths.append(ln)
-        elif current == "W": weaknesses.append(ln)
-    def top_k(sents, pos=True, k=3):
-        pos_kw = ["strength","novel","clear","sound","rigor","significant","thorough","well-written","solid"]
-        neg_kw = ["weak","limitation","concern","issue","unclear","missing","insufficient","confusing","error","bias"]
-        out = []
-        for s in sents:
-            toks = s.lower(); kws = pos_kw if pos else neg_kw
-            sc = sum(toks.count(w) for w in kws)
-            sc += 1 if (("+" in s or "✓" in s) if pos else ("-" in s or "✗" in s)) else 0
-            out.append((sc, s))
-        out.sort(key=lambda x: (-x[0], len(x[1])))
-        return [s for sc, s in out if sc > 0][:k]
-    if len(strengths) < 3 or len(weaknesses) < 3:
-        sents = _split_sents(text)
-        if len(strengths) < 3: strengths = (strengths + top_k(sents, pos=True,  k=3))[:3]
-        if len(weaknesses) < 3: weaknesses = (weaknesses + top_k(sents, pos=False, k=3))[:3]
-    strengths = (strengths + [""]*3)[:3]
-    weaknesses = (weaknesses + [""]*3)[:3]
-    return {"strengths": strengths, "weaknesses": weaknesses}
-
-def step_build_sw_references(split_csv: pathlib.Path, out_json: pathlib.Path):
-    df = pd.read_csv(split_csv)
-    with out_json.open("w", encoding="utf-8") as f:
-        for _, r in df.iterrows():
-            sw = extract_sw_from_review(str(r["review"]))
-            f.write(json.dumps({"title": r["title"],
-                                "strengths_ref": sw["strengths"],
-                                "weaknesses_ref": sw["weaknesses"]}, ensure_ascii=False) + "\n")
-    print(f"[refs] {out_json} saved")
-
-def step_zero_shot_structured_sw():
-    set_seed(); tok, mdl = load_model_and_tokenizer()
-    val_df = pd.read_csv(DATA_DIR / "val_clean.csv")
+def _gen_rows(df_in: pd.DataFrame, tok, mdl) -> List[Dict[str,Any]]:
     rows = []
-    for _, r in val_df.iterrows():
-        obj = generate_structured_json(tok, mdl, r["title"], r["abstract"], allow_fallback=True)
-        rows.append({"title": r["title"], "review_structured": json.dumps(obj, ensure_ascii=False)})
-    pd.DataFrame(rows).to_csv(DATA_DIR / "val_zero_shot_structured.csv", index=False)
-    print("[zssw] val_zero_shot_structured.csv saved")
+    device = mdl.device if hasattr(mdl, "device") else "cpu"
+    for _, r in df_in.iterrows():
+        sys, usr = build_prompts(r["title"], r["abstract"])
+        prompt = to_chat_prompt_with_template(tok, sys, usr)
+        inputs = tok(prompt, return_tensors="pt").to(device)
+        out = mdl.generate(**inputs, **GEN_KW, pad_token_id=tok.eos_token_id)
+        text = tok.decode(out[0], skip_special_tokens=True)
+        obj = _decode_last_json(text)
+        rows.append({
+            "title": r["title"],
+            "review_structured": json.dumps({"strengths":obj["strengths"], "weaknesses":obj["weaknesses"]}, ensure_ascii=False),
+            "parsed_rate": obj["rate"]
+        })
+    return rows
 
+def load_zeroshot_model():
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True, trust_remote_code=False)
+    if tok.pad_token is None: tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=dtype,
+                                               device_map="auto", trust_remote_code=False)
+    return tok, mdl
+
+def load_finetuned_model():
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from peft import PeftModel
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True, trust_remote_code=False)
+    if tok.pad_token is None: tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+    bf16_ok = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+    dtype = torch.bfloat16 if bf16_ok and torch.cuda.is_available() else (torch.float16 if torch.cuda.is_available() else torch.float32)
+    base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=dtype,
+                                                device_map="auto", trust_remote_code=False)
+    model = PeftModel.from_pretrained(base, str(MODEL_DIR / "finetuned-llama3"))
+    return tok, model
+
+# ---------- Steps: ZS/FT inference ----------
+def step_zero_shot_train_for_calibration():
+    set_seed()
+    tok, mdl = load_zeroshot_model()
+    tr = pd.read_csv(DATA_DIR / "train_clean.csv")
+    rows = _gen_rows(tr, tok, mdl)
+    pd.DataFrame(rows).to_csv(DATA_DIR / "train_structured.csv", index=False)
+    print("[zstrain] data/train_structured.csv")
+
+def step_zero_shot_val():
+    set_seed()
+    tok, mdl = load_zeroshot_model()
+    va = pd.read_csv(DATA_DIR / "val_clean.csv")
+    rows = _gen_rows(va, tok, mdl)
+    pd.DataFrame(rows).to_csv(RESULTS_DIR / "val_zeroshot_structured.csv", index=False)
+    print("[zseval] results/val_zeroshot_structured.csv")
+
+def step_finetuned_val():
+    set_seed()
+    tok, mdl = load_finetuned_model()
+    va = pd.read_csv(DATA_DIR / "val_clean.csv")
+    rows = _gen_rows(va, tok, mdl)
+    pd.DataFrame(rows).to_csv(RESULTS_DIR / "val_ft_structured.csv", index=False)
+    print("[infer_ft] results/val_ft_structured.csv")
+
+# ---------- S/W Evaluation ----------
 def _flatten_sw(obj_json: str, key: str) -> List[str]:
     try:
         o = json.loads(obj_json); arr = o.get(key, [])
-        return [str(x).strip() for x in (arr if isinstance(arr, list) else [arr])]
-    except: return ["", "", ""]
-
-def _pairwise(cands: List[str], refs: List[str]) -> Tuple[List[str], List[str]]:
-    cands = (cands + [""]*3)[:3]; refs = (refs + [""]*3)[:3]; return cands, refs
+        return [str(x).strip() for x in (arr if isinstance(arr, list) else [arr]) if str(x).strip()]
+    except: return []
 
 def _bootstrap_ci_scalar(values: List[float], alpha=0.05, seed=SEED) -> Tuple[float, float]:
     rng = np.random.default_rng(seed); arr = np.array(values, dtype=float)
@@ -600,144 +669,307 @@ def _bootstrap_ci_scalar(values: List[float], alpha=0.05, seed=SEED) -> Tuple[fl
     lo, hi = np.quantile(boots, [alpha/2, 1-alpha/2])
     return float(lo), float(hi)
 
-def step_eval_sw(model_csv: pathlib.Path, ref_jsonl: pathlib.Path,
-                 distilled_csv: Optional[pathlib.Path] = DATA_DIR / "val_structured.csv"):
+def _bertscore_bestmatch(cands: List[str], refs: List[str], lang="en"):
     from bert_score import score as bertscore
+    # normalize lists
+    cands = [c for c in (cands or []) if isinstance(c, str) and c.strip()]
+    refs = [r for r in (refs or []) if isinstance(r, str) and r.strip()]
+    if not cands or not refs:
+        return float("nan")
+
+    # fast path when lengths match 1:1
+    if len(cands) == len(refs):
+        _, _, F1 = bertscore(cands, refs, lang=lang, rescale_with_baseline=True)
+        F = F1.numpy() if hasattr(F1, "numpy") else np.array(F1)
+        # if vector, return mean
+        if F.ndim == 1:
+            return float(np.mean(F))
+    # build full pairwise matrix: shape (n_cands, n_refs)
+    n_c, n_r = len(cands), len(refs)
+    Fmat = np.zeros((n_c, n_r), dtype=float)
+    for j, ref in enumerate(refs):
+        # compute scores of all candidates vs this single ref (column)
+        _, _, Fcol = bertscore(cands, [ref] * n_c, lang=lang, rescale_with_baseline=True)
+        col = Fcol.numpy() if hasattr(Fcol, "numpy") else np.array(Fcol)
+        Fmat[:, j] = col
+
+    # Greedy best-match: order candidates by their best possible match (desc),
+    # then assign each the best remaining reference.
+    bests = [(i, int(Fmat[i].argmax()), float(Fmat[i].max())) for i in range(n_c)]
+    bests.sort(key=lambda x: -x[2])
+    used = set()
+    scores = []
+    for i, best_j, best_val in bests:
+        if best_j not in used:
+            used.add(best_j)
+            scores.append(best_val)
+            continue
+        # find next-best unused ref for this candidate
+        unused = [j for j in range(n_r) if j not in used]
+        if not unused:
+            continue
+        j2 = max(unused, key=lambda j: Fmat[i, j])
+        used.add(j2)
+        scores.append(float(Fmat[i, j2]))
+
+    return float(np.mean(scores)) if scores else float("nan")
+
+def step_build_sw_references(split_csv: pathlib.Path, out_json: pathlib.Path):
+    df = pd.read_csv(split_csv)
+    with out_json.open("w", encoding="utf-8") as f:
+        for _, r in df.iterrows():
+            sw = extract_sw_from_review(str(r["review"]))
+            f.write(json.dumps({"title": r["title"],
+                                "strengths_ref": sw["strengths"],
+                                "weaknesses_ref": sw["weaknesses"]}, ensure_ascii=False) + "\n")
+    print(f"[refs] {out_json} saved")
+
+def step_eval_sw():
+    ref_path = DATA_DIR / "val_sw_ref.jsonl"
     refs = {}
-    with ref_jsonl.open("r", encoding="utf-8") as f:
+    with ref_path.open("r", encoding="utf-8") as f:
         for line in f:
             j = json.loads(line); refs[j["title"]] = j
-    def _eval_one(csv_path: pathlib.Path, tag: str) -> Dict[str, Any]:
+
+    def _eval(csv_path: pathlib.Path, tag: str):
+        if not csv_path.exists(): return {}
         df = pd.read_csv(csv_path)
         s_scores, w_scores = [], []
         for _, r in df.iterrows():
-            ref = refs.get(r["title"]); 
+            ref = refs.get(r["title"])
             if not ref: continue
             cs = _flatten_sw(r["review_structured"], "strengths")
             cw = _flatten_sw(r["review_structured"], "weaknesses")
             rs = ref["strengths_ref"]; rw = ref["weaknesses_ref"]
-            cs, rs = _pairwise(cs, rs); cw, rw = _pairwise(cw, rw)
-            _, _, F1s = bertscore(cs, rs, lang="en", rescale_with_baseline=True)
-            _, _, F1w = bertscore(cw, rw, lang="en", rescale_with_baseline=True)
-            s_scores.append(float(F1s.mean())); w_scores.append(float(F1w.mean()))
-        out = {
-            f"{tag}.strengths.bertscore.F1.mean": float(np.mean(s_scores)) if s_scores else math.nan,
-            f"{tag}.weaknesses.bertscore.F1.mean": float(np.mean(w_scores)) if s_scores else math.nan,
-            f"{tag}.strengths.bertscore.F1.CI": list(_bootstrap_ci_scalar(s_scores)) if s_scores else [math.nan, math.nan],
-            f"{tag}.weaknesses.bertscore.F1.CI": list(_bootstrap_ci_scalar(w_scores)) if s_scores else [math.nan, math.nan],
-        }
+            s = _bertscore_bestmatch(cs, rs); w = _bertscore_bestmatch(cw, rw)
+            if not (np.isnan(s) or np.isinf(s)): s_scores.append(float(s))
+            if not (np.isnan(w) or np.isinf(w)): w_scores.append(float(w))
+        out = {}
+        if s_scores:
+            out[f"{tag}.strengths.bertscore.F1.mean"] = float(np.mean(s_scores))
+            out[f"{tag}.strengths.bertscore.F1.CI"] = list(_bootstrap_ci_scalar(s_scores))
+        if w_scores:
+            out[f"{tag}.weaknesses.bertscore.F1.mean"] = float(np.mean(w_scores))
+            out[f"{tag}.weaknesses.bertscore.F1.CI"] = list(_bootstrap_ci_scalar(w_scores))
         return out
-    merged = {}
-    merged.update(_eval_one(model_csv, "zero_shot"))
-    if distilled_csv and pathlib.Path(distilled_csv).exists():
-        merged.update(_eval_one(distilled_csv, "distilled"))
-    metrics_path = RESULTS_DIR / "metrics_flat.json"
-    if metrics_path.exists():
-        base = json.loads(metrics_path.read_text(encoding="utf-8")); base.update(merged)
-        metrics_path.write_text(json.dumps(base, indent=2), encoding="utf-8")
-    else:
-        metrics_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
-    (RESULTS_DIR / "sw_metrics.json").write_text(json.dumps(merged, indent=2), encoding="utf-8")
-    print("[evalsw] sw_metrics.json saved (merged into metrics_flat.json)")
 
-# -------------------------
-# Merge + Plots
-# -------------------------
+    merged = {}
+    merged.update(_eval(RESULTS_DIR / "val_zeroshot_structured.csv", "zeroshot"))
+    merged.update(_eval(RESULTS_DIR / "val_ft_structured.csv", "finetuned"))
+    (RESULTS_DIR / "sw_metrics.json").write_text(json.dumps(merged, indent=2), encoding="utf-8")
+
+    flat_p = RESULTS_DIR / "metrics_flat.json"
+    base = json.loads(flat_p.read_text(encoding="utf-8")) if flat_p.exists() else {}
+    base.update(merged)
+    flat_p.write_text(json.dumps(base, indent=2), encoding="utf-8")
+    print("[evalsw] sw_metrics.json saved & merged")
+
+# ---------- Rate Evaluation ----------
+def _rmse(y_true, y_pred):
+    from sklearn.metrics import mean_squared_error
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+def _eval_reg(y_true, y_pred):
+    from sklearn.metrics import mean_absolute_error, r2_score
+    from scipy.stats import pearsonr
+    yt, yp = np.array(y_true, dtype=float), np.array(y_pred, dtype=float)
+    mask = ~np.isnan(yp)
+    yt, yp = yt[mask], yp[mask]
+    return {
+        "MAE": float(mean_absolute_error(yt, yp)),
+        "RMSE": _rmse(yt, yp),
+        "R2": float(r2_score(yt, yp)),
+        "Pearson": float(pearsonr(yt, yp)[0]) if len(yt) > 1 else float("nan"),
+        "N": int(len(yt)),
+    }
+
+def _bootstrap_ci(metric_fn, y_true, y_pred, n_boot=2000, alpha=0.05):
+    rng = np.random.default_rng(SEED)
+    yt, yp = np.array(y_true), np.array(y_pred); n = len(yt)
+    vals = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        vals.append(metric_fn(yt[idx], yp[idx]))
+    lo, hi = np.quantile(vals, [alpha/2, 1-alpha/2])
+    return float(lo), float(hi)
+
+def _fit_rate_calibrator(train_structured_csv: pathlib.Path, train_clean_csv: pathlib.Path) -> Tuple[float,float]:
+    from sklearn.linear_model import HuberRegressor
+    if not (train_structured_csv.exists() and train_clean_csv.exists()):
+        return (1.0, 0.0)
+    tr_s = pd.read_csv(train_structured_csv)  # has parsed_rate (ZS on train)
+    tr_c = pd.read_csv(train_clean_csv)       # has rate_mean
+    if "parsed_rate" not in tr_s.columns or "rate_mean" not in tr_c.columns: return (1.0, 0.0)
+    df = tr_s.merge(tr_c[["title","rate_mean"]], on="title", how="inner").dropna(subset=["parsed_rate","rate_mean"])
+    if len(df) < 8: return (1.0, 0.0)
+    x = df["parsed_rate"].astype(float).to_numpy().reshape(-1,1)
+    y = df["rate_mean"].astype(float).to_numpy()
+    reg = HuberRegressor().fit(x, y)
+    return (float(reg.coef_[0]), float(reg.intercept_))
+
+def _apply_calibration(arr: List[Optional[float]], a: float, b: float):
+    out = []
+    for v in arr:
+        if v is None or (isinstance(v,float) and np.isnan(v)): out.append(None)
+        else: out.append(float(max(1.0, min(10.0, a*float(v)+b))))
+    return out
+
+def step_eval_rate():
+    val_df = pd.read_csv(DATA_DIR / "val_clean.csv").dropna(subset=["rate_mean"])
+    y_true_map = dict(zip(val_df["title"], val_df["rate_mean"]))
+
+    def _load_pred(csv_path: pathlib.Path):
+        if not csv_path.exists(): return {}
+        df = pd.read_csv(csv_path)
+        return {r["title"]: (None if pd.isna(r["parsed_rate"]) else float(r["parsed_rate"])) for _,r in df.iterrows()}
+
+    zs = _load_pred(RESULTS_DIR / "val_zeroshot_structured.csv")
+    ft = _load_pred(RESULTS_DIR / "val_ft_structured.csv")
+
+    def _align(pred_map):
+        yt, yp = [], []
+        for t, y in y_true_map.items():
+            p = pred_map.get(t, None)
+            if p is not None:
+                yt.append(float(y)); yp.append(float(p))
+        return yt, yp
+
+    yt_zs, yp_zs = _align(zs)
+    yt_ft, yp_ft = _align(ft)
+
+    tr = pd.read_csv(DATA_DIR / "train_clean.csv").dropna(subset=["rate_mean"])
+    mean_pred = float(np.nanmean(tr["rate_mean"]))
+    yt_base = list(y_true_map.values())
+    yp_mean = [mean_pred]*len(yt_base)
+
+    from sklearn.linear_model import LinearRegression
+    Xtr = tr["abstract"].str.len().to_numpy().reshape(-1,1)
+    ytr = tr["rate_mean"].astype(float).to_numpy()
+    Xva = val_df["abstract"].str.len().to_numpy().reshape(-1,1)
+    reg = LinearRegression().fit(Xtr, ytr)
+    yp_lin_full = reg.predict(Xva)
+    yp_lin = [float(p) for p in yp_lin_full]
+    yt_lin = yt_base
+
+    a, b = _fit_rate_calibrator(DATA_DIR / "train_structured.csv", DATA_DIR / "train_clean.csv")
+    yp_zs_cal = _apply_calibration(yp_zs, a, b) if yp_zs else []
+    yp_ft_cal = _apply_calibration(yp_ft, a, b) if yp_ft else []
+
+    def pack_metrics(tag, yt, yp):
+        if not yt or not yp: return {}
+        m = _eval_reg(yt, yp)
+        ci = {
+            "MAE_CI": list(_bootstrap_ci(lambda a,b: _eval_reg(a,b)["MAE"], np.array(yt), np.array(yp))),
+            "RMSE_CI": list(_bootstrap_ci(lambda a,b: _eval_reg(a,b)["RMSE"], np.array(yt), np.array(yp))),
+        }
+        return {tag: {**m, **ci}}
+
+    metrics = {}
+    metrics.update(pack_metrics("baseline.mean", yt_base, yp_mean))
+    metrics.update(pack_metrics("baseline.len_linear", yt_lin, yp_lin))
+    metrics.update(pack_metrics("zeroshot.raw", yt_zs, yp_zs))
+    metrics.update(pack_metrics("zeroshot.cal", yt_zs, yp_zs_cal))
+    metrics.update(pack_metrics("finetuned.raw", yt_ft, yp_ft))
+    metrics.update(pack_metrics("finetuned.cal", yt_ft, yp_ft_cal))
+    (RESULTS_DIR / "rate_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    flat_p = RESULTS_DIR / "metrics_flat.json"
+    flat = json.loads(flat_p.read_text(encoding="utf-8")) if flat_p.exists() else {}
+    for k, v in metrics.items():
+        for kk, vv in v.items():
+            flat[f"rate.{k}.{kk}"] = vv
+    flat_p.write_text(json.dumps(flat, indent=2), encoding="utf-8")
+    print("[evalrate] rate_metrics.json saved & merged")
+
+# ---------- Plots ----------
 def step_plot_and_merge():
     import matplotlib.pyplot as plt
     merged = {}
-    bp = RESULTS_DIR / "baseline_metrics.json"
-    if bp.exists():
-        base = json.loads(bp.read_text(encoding="utf-8"))
-        for k, (main, ci) in base.items():
-            for m, v in main.items(): merged[f"baseline.{k}.{m}"] = v
-            for m, v in ci.items():   merged[f"baseline.{k}.{m}"] = v
-    zp = RESULTS_DIR / "zs_metrics.json"
-    if zp.exists():
-        zs = json.loads(zp.read_text(encoding="utf-8"))
-        for k, main in zs.items():
-            for m, v in main.items(): merged[f"zero_shot.{k}.{m}"] = v
+
     sp = RESULTS_DIR / "sw_metrics.json"
-    if sp.exists():
-        sw = json.loads(sp.read_text(encoding="utf-8")); merged.update(sw)
+    if sp.exists(): merged.update(json.loads(sp.read_text(encoding="utf-8")))
+    rp = RESULTS_DIR / "rate_metrics.json"
+    if rp.exists():
+        rate = json.loads(rp.read_text(encoding="utf-8"))
+        for tag, vals in rate.items():
+            for k, v in vals.items():
+                merged[f"rate.{tag}.{k}"] = v
+
     pd.Series(merged).to_csv(RESULTS_DIR / "metrics_flat.csv")
     (RESULTS_DIR / "metrics_flat.json").write_text(json.dumps(merged, indent=2), encoding="utf-8")
     print("[merge] metrics_flat.{json,csv} saved")
-    pairs = [
-        ("baseline.rate_mean_baseline.MAE", "baseline.rate_mean_baseline.MAE_CI", "Mean BL"),
-        ("baseline.rate_len_linear.MAE",    "baseline.rate_len_linear.MAE_CI",    "Len Linear"),
-        ("zero_shot.rate_zero_shot.MAE",    None,                                 "Zero-shot"),
-    ]
-    xs, means, lows, highs, labels = [], [], [], [], []
-    for i, (m, ci, lab) in enumerate(pairs):
-        mean = merged.get(m, None)
-        if mean is None: continue
-        xs.append(i); means.append(mean); labels.append(lab)
-        if ci and merged.get(ci): lo, hi = merged[ci]
-        else: lo, hi = mean, mean
-        lows.append(lo); highs.append(hi)
-    if xs:
-        fig, ax = plt.subplots(figsize=(8,5))
-        for i, mean in enumerate(means):
-            ax.bar(i, mean, width=0.5)
-            lo, hi = lows[i], highs[i]
-            ax.errorbar(i, mean, yerr=[[mean-lo],[hi-mean]], fmt="none", capsize=5)
-        ax.set_xticks(xs); ax.set_xticklabels(labels, rotation=20, ha="right")
-        ax.set_ylabel("MAE (±CI)"); ax.set_title("Rate — Baselines vs Zero-shot")
-        plt.tight_layout(); fig.savefig(RESULTS_DIR / "rate_mae_ci_plot.png", dpi=160)
-        print("[plot] rate_mae_ci_plot.png saved")
-    sw_keys = [
-        ("zero_shot.strengths.bertscore.F1.mean", "ZS Strengths"),
-        ("zero_shot.weaknesses.bertscore.F1.mean", "ZS Weaknesses"),
-        ("distilled.strengths.bertscore.F1.mean",  "LoRA Strengths"),
-        ("distilled.weaknesses.bertscore.F1.mean", "LoRA Weaknesses"),
+
+    keys_sw = [
+        ("zeroshot.strengths.bertscore.F1.mean", "ZS Strengths"),
+        ("zeroshot.weaknesses.bertscore.F1.mean", "ZS Weaknesses"),
+        ("finetuned.strengths.bertscore.F1.mean", "FT Strengths"),
+        ("finetuned.weaknesses.bertscore.F1.mean", "FT Weaknesses"),
     ]
     vals, lbls = [], []
-    for k, lab in sw_keys:
-        v = merged.get(k); 
+    for k, lab in keys_sw:
+        v = merged.get(k)
         if v is not None: vals.append(v); lbls.append(lab)
     if vals:
         fig, ax = plt.subplots(figsize=(7,4))
         ax.bar(range(len(vals)), vals)
         ax.set_xticks(range(len(vals))); ax.set_xticklabels(lbls, rotation=15, ha="right")
-        ax.set_ylim(0, 1.0); ax.set_ylabel("BERTScore F1")
-        ax.set_title("Strengths/Weaknesses — BERTScore")
+        ax.set_ylim(0, 1.0); ax.set_ylabel("BERTScore F1 (↑)")
+        ax.set_title("S/W — Zero-shot vs Fine-tuned")
         plt.tight_layout(); fig.savefig(RESULTS_DIR / "sw_bertscore_plot.png", dpi=160)
         print("[plot] sw_bertscore_plot.png saved")
 
-# -------------------------
-# CLI
-# -------------------------
+    mae_keys = [
+        ("rate.baseline.mean.MAE", "BL Mean"),
+        ("rate.baseline.len_linear.MAE", "BL LenLin"),
+        ("rate.zeroshot.raw.MAE", "ZS raw"),
+        ("rate.zeroshot.cal.MAE", "ZS cal"),
+        ("rate.finetuned.raw.MAE", "FT raw"),
+        ("rate.finetuned.cal.MAE", "FT cal"),
+    ]
+    rvals, rlbls = [], []
+    for k, lab in mae_keys:
+        v = merged.get(k)
+        if v is not None: rvals.append(v); rlbls.append(lab)
+    if rvals:
+        fig, ax = plt.subplots(figsize=(8,4))
+        ax.bar(range(len(rvals)), rvals)
+        ax.set_xticks(range(len(rvals))); ax.set_xticklabels(rlbls, rotation=15, ha="right")
+        ax.set_ylabel("MAE (↓)")
+        ax.set_title("Rate — Baselines vs Zero-shot vs Fine-tuned")
+        plt.tight_layout(); fig.savefig(RESULTS_DIR / "rate_mae_plot.png", dpi=160)
+        print("[plot] rate_mae_plot.png saved")
+
+# ---------- CLI ----------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--step", type=str, default="all",
-        help=("prepare | distill | buildds | finetune | baselines | zseval | refs | zssw | evalsw | plot | all"))
-    parser.add_argument("--source", type=str, default="excel", choices=["excel","csv"])
-    parser.add_argument("--xlsx", type=str, default=str(DATA_DIR / "tp_2020conference.xlsx"))
-    parser.add_argument("--limit", type=int, default=None)
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--step", type=str, default="all",
+                   help="prepare | sup | buildds | finetune | zstrain | zseval | refs | infer_ft | evalsw | evalrate | plot | all")
+    p.add_argument("--xlsx", type=str, default=str(DATA_DIR / "tp_2020conference.xlsx"))
+    args = p.parse_args()
 
     set_seed(); env_report()
 
     if args.step in ("prepare", "all"):
         step_prepare(pathlib.Path(args.xlsx))
-    if args.step in ("distill", "all"):
-        step_distill_structured(limit=args.limit)
+    if args.step in ("sup", "all"):
+        step_make_supervised_targets(DATA_DIR / "train_clean.csv", DATA_DIR / "train_supervised.csv", is_train=True)
+        step_make_supervised_targets(DATA_DIR / "val_clean.csv",   DATA_DIR / "val_supervised.csv",   is_train=False)
     if args.step in ("buildds", "all"):
         build_hf_datasets()
     if args.step in ("finetune", "all"):
-        step_finetune_lora()
-    if args.step in ("baselines", "all"):
-        step_baselines_and_ci()
+        finetune_lora()
+    if args.step in ("zstrain", "all"):
+        step_zero_shot_train_for_calibration()
     if args.step in ("zseval", "all"):
-        step_zero_shot_numeric_eval()
+        step_zero_shot_val()
     if args.step in ("refs", "all"):
         step_build_sw_references(DATA_DIR / "val_clean.csv", DATA_DIR / "val_sw_ref.jsonl")
-    if args.step in ("zssw", "all"):
-        step_zero_shot_structured_sw()
+    if args.step in ("infer_ft", "all"):
+        step_finetuned_val()
     if args.step in ("evalsw", "all"):
-        step_eval_sw(DATA_DIR / "val_zero_shot_structured.csv", DATA_DIR / "val_sw_ref.jsonl",
-                     distilled_csv=DATA_DIR / "val_structured.csv")
+        step_eval_sw()
+    if args.step in ("evalrate", "all"):
+        step_eval_rate()
     if args.step in ("plot", "all"):
         step_plot_and_merge()
 
