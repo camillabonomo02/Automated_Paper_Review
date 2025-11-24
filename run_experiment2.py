@@ -1,3 +1,4 @@
+# run_experiment2.py
 import os
 import re
 import json
@@ -12,12 +13,13 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-# ML Imports
+# ML imports
 from sklearn.linear_model import HuberRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from scipy.stats import pearsonr
+from sklearn.model_selection import train_test_split
 
-# HF Imports
+# HF imports
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -36,32 +38,55 @@ from peft import (
 from datasets import Dataset
 
 
-# --- CONFIGURATION ---
+# ---------------------------
+# CONFIG
+# ---------------------------
 class Config:
     SEED = 42
     MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct"
-    MAX_SEQ_LEN = 512
+    MAX_SEQ_LEN = 700  # include anche review in alcuni esempi per LoRA
 
     ROOT = pathlib.Path(".").resolve()
     DATA_DIR = ROOT / "data"
     RESULTS_DIR = ROOT / "results"
     MODEL_DIR = ROOT / "model"
 
-    # LoRA Params
+    # LoRA params
     LORA_R = 8
     LORA_ALPHA = 16
     LORA_DROPOUT = 0.05
 
-    # Training Params (fixed, no early stopping)
+    # Training params
     LR = 2e-4
     EPOCHS = 1
     BATCH_SIZE = 2
     GRAD_ACC_STEPS = 4
 
-    # Inference Params
-    MAX_NEW_TOKENS_FULL = 300     # full JSON (val only)
-    MAX_NEW_TOKENS_RATE = 60      # rate-only (train for calibration)
-    INFER_BATCH_SIZE = 8          # batching during inference
+    # Teacher extraction (zeroshot)
+    # più bassi = più veloci; se JSON tronchi alzi solo di poco
+    TEACHER_MAX_NEW_TOKENS = 140
+    TEACHER_BATCH_SIZE = 12
+    TEACHER_TEMPERATURE = 0.0     # deterministico
+    TEACHER_TOP_P = 1.0
+
+    # Fai teacher su VAL solo su un subset per risparmiare tempo
+    TEACHER_VAL_MAX_EXAMPLES = 300  # metti None per farli tutti (lento)
+
+    # Resume teacher: se file esiste continua
+    TEACHER_RESUME = True
+
+    # Inference full
+    MAX_NEW_TOKENS_FULL = 220
+    INFER_BATCH_SIZE = 8
+    INFER_TEMPERATURE = 0.1
+
+    # Mix prompt training
+    # Prob che un esempio includa anche la review in input
+    MIX_USE_REVIEW_PROB = 0.5
+
+    # Retry policy JSON teacher
+    TEACHER_RETRY_MAX = 2
+    TEACHER_RETRY_TOKENS_BOOST = 80  # se fallisce, aumenta tokens così
 
     def __init__(self):
         for d in (self.DATA_DIR, self.RESULTS_DIR, self.MODEL_DIR):
@@ -71,7 +96,9 @@ class Config:
 CFG = Config()
 
 
-# --- UTILS ---
+# ---------------------------
+# UTILS
+# ---------------------------
 def set_seed(seed: int = CFG.SEED):
     random.seed(seed)
     np.random.seed(seed)
@@ -88,29 +115,39 @@ def setup_logging():
     )
 
 
-# --- 1. DATA PROCESSOR ---
+def batched(iterable, n):
+    for i in range(0, len(iterable), n):
+        yield i, iterable[i:i+n]
+
+
+# ---------------------------
+# 1. DATA PROCESSOR
+# ---------------------------
 class DataProcessor:
-    """Handles parsing of Excel/CSV and creating training targets."""
+    """
+    Pipeline:
+      1) load raw, clean, split train/val
+      2) create S/W teacher targets (zeroshot) on train + small val subset
+      3) save train_sw_targets.csv / val_sw_targets.csv
+    """
 
     @staticmethod
     def clean_text(text: Any) -> str:
         if not isinstance(text, str):
             return ""
-        text = re.sub(r"https?://\S+", "", text)  # remove URLs
-        text = text.replace("Abstract:", "").strip()
-        text = text.replace("Review:", "").replace("###", " ")
+        text = re.sub(r"https?://\S+", "", text)
+        text = text.replace("Abstract:", "").replace("Review:", "")
+        text = text.replace("###", " ")
         text = re.sub(r"\s+", " ", text)
         return text.strip()
 
     @staticmethod
     def parse_rate(val: Any) -> Optional[float]:
-        """Robust parsing of numeric scores from mixed Excel formats."""
         if val is None or (isinstance(val, float) and np.isnan(val)):
             return None
 
         s = str(val).lower().strip().replace(",", ".")
 
-        # 1) Fraction "8/10"
         match = re.search(r"(\d+(?:\.\d+)?)\s*/\s*(\d+)", s)
         if match:
             num, den = float(match.group(1)), float(match.group(2))
@@ -121,16 +158,14 @@ class DataProcessor:
             if den > 0:
                 return (num / den) * 10.0
 
-        # 2) Simple number inside text
         try:
             floats = re.findall(r"\d+\.?\d*", s)
-            valid_nums = [float(f) for f in floats if 1.0 <= float(f) <= 10.0]
-            if valid_nums:
-                return valid_nums[-1]
+            valid = [float(f) for f in floats if 1.0 <= float(f) <= 10.0]
+            if valid:
+                return valid[-1]
         except ValueError:
             pass
 
-        # 3) Text Labels
         labels = {
             "strong accept": 9.5,
             "accept": 8.0,
@@ -146,77 +181,15 @@ class DataProcessor:
 
         return None
 
-    def _extract_sw_from_text(self, text: str) -> Tuple[List[str], List[str]]:
-        """
-        Extract Strengths/Weaknesses from unstructured review text.
-        Handles OpenReview-ish markdown, headers, bullets, and fallback cues.
-        """
-        text = str(text)
-
-        # 0) OpenReview/Markdown cleanup
-        text = re.sub(r"^review\s*:\s*", "", text, flags=re.I)
-        text = text.replace("###", "\n")
-        text = re.sub(r"\r\n?", "\n", text)
-        text = re.sub(r"[ \t]+", " ", text)
-
-        # 1) normalize common headers
-        header_map = {
-            r"\bstrong points?\b": "strengths",
-            r"\bpositives?\b": "strengths",
-            r"\bpros\b": "strengths",
-            r"\bweak points?\b": "weaknesses",
-            r"\bnegatives?\b": "weaknesses",
-            r"\bcons\b": "weaknesses",
-            r"\blimitations?\b": "weaknesses",
-        }
-        for pat, rep in header_map.items():
-            text = re.sub(pat, rep, text, flags=re.I)
-
-        # 2) find header blocks
-        p_str = r"strengths\s*[:\-]?\s*(.*?)(?=\n\s*weaknesses\s*[:\-]|\Z)"
-        p_weak = r"weaknesses\s*[:\-]?\s*(.*?)(?=\n\s*strengths\s*[:\-]|\Z)"
-
-        m_str = re.search(p_str, text, flags=re.I | re.S)
-        m_weak = re.search(p_weak, text, flags=re.I | re.S)
-
-        def split_items(block: str) -> List[str]:
-            block = block.strip()
-            items = re.split(r"(?:\n\s*[\-\*•]\s*|\n\s*\d+[.)]\s*)", block)
-            items = [re.sub(r"\s+", " ", i).strip() for i in items]
-            items = [i for i in items if len(i) > 15]
-            return items[:3]
-
-        strengths = split_items(m_str.group(1)) if m_str else []
-        weaknesses = split_items(m_weak.group(1)) if m_weak else []
-
-        # 3) fallback cues if no headers found
-        if not strengths and not weaknesses:
-            sents = re.split(r"(?<=[.!?])\s+", text)
-            pos_cues = ("novel", "interesting", "strong", "clear", "well-written", "effective")
-            neg_cues = ("weak", "unclear", "lacking", "missing", "problem", "limitation", "concern")
-
-            for sent in sents:
-                low = sent.lower()
-                if any(c in low for c in pos_cues) and len(strengths) < 3:
-                    strengths.append(sent.strip()[:250])
-                elif any(c in low for c in neg_cues) and len(weaknesses) < 3:
-                    weaknesses.append(sent.strip()[:250])
-
-            if not strengths:
-                strengths = [sents[0].strip()[:250]] if sents else []
-            weaknesses = weaknesses[:3]
-
-        return strengths, weaknesses
-
     def prepare_data(self, file_path: str):
         logging.info(f"Loading data from {file_path}...")
+
         if file_path.endswith(".csv"):
             df = pd.read_csv(file_path)
         else:
-            df = pd.read_excel(file_path)  # needs openpyxl
+            df = pd.read_excel(file_path)
 
         df.columns = [c.strip().lower() for c in df.columns]
-
         rate_cols = [c for c in df.columns if any(x in c for x in ["rate", "score", "overall"])]
         logging.info(f"Rating columns found: {rate_cols}")
 
@@ -224,95 +197,237 @@ class DataProcessor:
         for _, row in tqdm(df.iterrows(), total=len(df), desc="Cleaning"):
             rating = None
             for c in rate_cols:
-                parsed = self.parse_rate(row[c])
+                parsed = self.parse_rate(row.get(c))
                 if parsed is not None:
                     rating = parsed
                     break
-
-            rev_text = self.clean_text(row.get("review", ""))
 
             processed.append(
                 {
                     "title": self.clean_text(row.get("title", "")),
                     "abstract": self.clean_text(row.get("abstract", "")),
-                    "review": rev_text,
+                    "review": self.clean_text(row.get("review", "")),
                     "rate": rating,
                 }
             )
 
         df_clean = pd.DataFrame(processed).dropna(subset=["title", "abstract"])
+        train_df, val_df = train_test_split(df_clean, test_size=0.2, random_state=CFG.SEED)
 
-        from sklearn.model_selection import train_test_split
+        train_df.to_csv(CFG.DATA_DIR / "train_clean.csv", index=False)
+        val_df.to_csv(CFG.DATA_DIR / "val_clean.csv", index=False)
+        logging.info(f"Split saved. Train: {len(train_df)}, Val: {len(val_df)}")
 
-        train, val = train_test_split(df_clean, test_size=0.2, random_state=CFG.SEED)
+    def create_sw_targets_from_teacher(self):
+        """
+        Teacher vede SOLO title+abstract.
+        Usa resume e val-subset per velocità.
+        """
+        logging.info("Creating S/W targets using ZERO-SHOT teacher (title+abstract only)...")
 
-        train.to_csv(CFG.DATA_DIR / "train_clean.csv", index=False)
-        val.to_csv(CFG.DATA_DIR / "val_clean.csv", index=False)
-        logging.info(f"Split saved. Train: {len(train)}, Val: {len(val)}")
+        tok = AutoTokenizer.from_pretrained(CFG.MODEL_ID)
+        tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
 
-    def create_supervised_json(self):
-        logging.info("Generating supervised JSON targets...")
+        bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+        teacher = AutoModelForCausalLM.from_pretrained(
+            CFG.MODEL_ID, quantization_config=bnb, device_map="auto"
+        )
+
+        pipe = pipeline(
+            "text-generation",
+            model=teacher,
+            tokenizer=tok,
+            max_new_tokens=CFG.TEACHER_MAX_NEW_TOKENS,
+            temperature=CFG.TEACHER_TEMPERATURE,
+            top_p=CFG.TEACHER_TOP_P,
+            do_sample=False,
+            return_full_text=False,
+            batch_size=CFG.TEACHER_BATCH_SIZE,
+        )
+
+        mm = ModelManager()
+
         for split in ["train", "val"]:
-            path = CFG.DATA_DIR / f"{split}_clean.csv"
-            df = pd.read_csv(path)
+            df = pd.read_csv(CFG.DATA_DIR / f"{split}_clean.csv")
+
+            # per val prendi solo subset (veloce)
+            if split == "val" and CFG.TEACHER_VAL_MAX_EXAMPLES is not None:
+                df = df.sample(CFG.TEACHER_VAL_MAX_EXAMPLES, random_state=CFG.SEED)
+
+            out_path = CFG.DATA_DIR / f"{split}_sw_targets.csv"
+
             rows = []
+            start_idx = 0
 
-            for _, r in df.iterrows():
-                if pd.isna(r["rate"]) or pd.isna(r["review"]) or str(r["review"]).strip() == "":
-                    continue
+            # resume
+            if CFG.TEACHER_RESUME and out_path.exists():
+                old = pd.read_csv(out_path)
+                rows = old.to_dict("records")
+                start_idx = len(old)
+                logging.info(f"Resuming teacher for {split} at idx {start_idx}.")
 
-                s, w = self._extract_sw_from_text(r["review"])
+            for i, batch in batched(df.iloc[start_idx:].reset_index(drop=True), CFG.TEACHER_BATCH_SIZE):
+                prompts = []
+                for _, r in batch.iterrows():
+                    msgs = mm._get_sw_prompt(r["title"], r["abstract"])
+                    prompts.append(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
 
-                target = {"strengths": s, "weaknesses": w, "rate": float(r["rate"])}
+                outs = pipe(prompts)
 
-                rows.append(
-                    {
-                        "title": r["title"],
-                        "abstract": r["abstract"],
-                        "target_json": json.dumps(target, ensure_ascii=False),
-                    }
-                )
+                for r_row, o in zip(batch.itertuples(index=False), outs):
+                    out_text = o[0]["generated_text"]
+                    parsed_json = self._teacher_parse_with_retry(
+                        mm, pipe, tok, r_row.title, r_row.abstract, out_text
+                    )
 
-            out_path = CFG.DATA_DIR / f"{split}_supervised.csv"
-            pd.DataFrame(rows).to_csv(out_path, index=False)
-            logging.info(f"Targets created for {split}: {len(rows)} samples")
+                    rows.append({
+                        "title": r_row.title,
+                        "abstract": r_row.abstract,
+                        "review": r_row.review,
+                        "target_json": json.dumps(parsed_json, ensure_ascii=False),
+                    })
+
+                # salva incrementalmente (così non perdi progresso)
+                pd.DataFrame(rows).to_csv(out_path, index=False)
+
+            logging.info(f"S/W targets created for {split}: {len(rows)} samples")
+
+    def _teacher_parse_with_retry(
+        self,
+        mm,
+        pipe,
+        tok,
+        title: str,
+        abstract: str,
+        out_text: str
+    ) -> Dict[str, Any]:
+        """
+        1) parse robusto
+        2) retry se JSON rotto o liste vuote
+        3) fallback soft se ancora vuoto
+        """
+        parsed = mm._extract_json(out_text)
+        parsed = mm._ensure_non_empty_sw(parsed)
+
+        if mm._is_good_sw(parsed):
+            return parsed
+
+        # retry mirato
+        for k in range(CFG.TEACHER_RETRY_MAX):
+            msgs = mm._get_sw_prompt_strict(title, abstract)
+            prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+            outs = pipe(
+                [prompt],
+                max_new_tokens=CFG.TEACHER_MAX_NEW_TOKENS + (k+1)*CFG.TEACHER_RETRY_TOKENS_BOOST,
+                temperature=0.0,
+                do_sample=False,
+                return_full_text=False
+            )
+            retry_text = outs[0][0]["generated_text"]
+            parsed = mm._extract_json(retry_text)
+            parsed = mm._ensure_non_empty_sw(parsed)
+            if mm._is_good_sw(parsed):
+                return parsed
+
+        # fallback: non vuoi mai vuoto
+        return mm._fallback_sw(title, abstract)
 
 
-# --- 2. MODEL MANAGER ---
+# ---------------------------
+# 2. MODEL MANAGER
+# ---------------------------
 class ModelManager:
-    def __init__(self):
-        self.tokenizer = None
 
-    # full task prompt (S/W + rate)
-    def _get_chat_prompt(self, title: str, abstract: str) -> List[Dict]:
+    # ---- PROMPTS ----
+    def _scale_hint(self) -> str:
+        return (
+            "Use the full 1-10 scale. "
+            "1-3 = reject / major flaws, "
+            "4-6 = borderline / mixed, "
+            "7-8 = accept, "
+            "9-10 = strong accept."
+        )
+
+    # base prompt S/W (zeroshot)
+    def _get_sw_prompt(self, title: str, abstract: str) -> List[Dict]:
         sys_msg = (
             "You are an expert reviewer. Analyze the title and abstract. "
-            "Return ONLY a JSON with keys: 'strengths' (list), 'weaknesses' (list), "
-            "'rate' (number 1-10). No intro text."
+            "Return ONLY a JSON with keys: "
+            "'strengths' (list of 1-3 short bullet points), "
+            "'weaknesses' (list of 1-3 short bullet points). "
+            "No rating, no extra text. End after the JSON."
         )
         user_msg = f"Title: {title}\nAbstract: {abstract}"
-        return [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}]
+        return [{"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}]
 
-    # cheap prompt (only rate) for calibration
+    # stricter prompt for retries
+    def _get_sw_prompt_strict(self, title: str, abstract: str) -> List[Dict]:
+        sys_msg = (
+            "You are an expert reviewer. "
+            "Return ONLY a VALID JSON object, nothing else. "
+            "Keys must be exactly: strengths, weaknesses. "
+            "strengths = list with at least 1 item. "
+            "weaknesses = list with at least 1 item. "
+            "No markdown, no commentary, no rating."
+        )
+        user_msg = f"Title: {title}\nAbstract: {abstract}"
+        return [{"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}]
+
+    # Prompt TRAIN S/W con review in input (mix)
+    def _get_sw_train_prompt(
+        self, title: str, abstract: str, review: str, use_review: bool
+    ) -> List[Dict]:
+        sys_msg = (
+            "You are an expert reviewer. "
+            "Extract ONLY a VALID JSON with keys: strengths, weaknesses. "
+            "Each is a list of 1-3 concise points. "
+            "No rating, no extra text."
+        )
+        if use_review and isinstance(review, str) and review.strip():
+            user_msg = (
+                f"Title: {title}\n"
+                f"Abstract: {abstract}\n\n"
+                f"Full review:\n{review}"
+            )
+        else:
+            user_msg = f"Title: {title}\nAbstract: {abstract}"
+
+        return [{"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}]
+
+    # Prompt rate-only per logits
     def _get_rate_only_prompt(self, title: str, abstract: str) -> List[Dict]:
         sys_msg = (
-            "You are an expert reviewer. Given title and abstract, "
-            "return ONLY a JSON: {'rate': number between 1 and 10}. "
-            "No other keys, no text."
+            "You are an expert reviewer. "
+            + self._scale_hint() +
+            " Return ONLY a JSON: {'rate': number between 1 and 10}. No other text."
         )
         user_msg = f"Title: {title}\nAbstract: {abstract}"
-        return [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}]
+        return [{"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}]
 
-    def train_lora(self):
-        logging.info("--- Starting LoRA Training (fixed 1 epoch) ---")
+    # ---- TRAIN LORA ON SW STRUCTURE ----
+    def train_lora_sw_only(self):
+        """
+        LoRA per imparare SOLO struttura S/W teacher-style.
+        """
+        logging.info("--- Starting LoRA Training on S/W JSON targets ---")
+
         tok = AutoTokenizer.from_pretrained(CFG.MODEL_ID)
         tok.pad_token = tok.eos_token
 
-        train_df = pd.read_csv(CFG.DATA_DIR / "train_supervised.csv")
-        val_df = pd.read_csv(CFG.DATA_DIR / "val_supervised.csv")
+        train_df = pd.read_csv(CFG.DATA_DIR / "train_sw_targets.csv")
+        val_df = pd.read_csv(CFG.DATA_DIR / "val_sw_targets.csv")
 
         def format_fn(x):
-            msgs = self._get_chat_prompt(x["title"], x["abstract"])
+            use_review = (random.random() < CFG.MIX_USE_REVIEW_PROB)
+            msgs = self._get_sw_train_prompt(
+                x["title"], x["abstract"], x.get("review", ""), use_review=use_review
+            )
             msgs.append({"role": "assistant", "content": x["target_json"]})
             return {"text": tok.apply_chat_template(msgs, tokenize=False)}
 
@@ -320,14 +435,7 @@ class ModelManager:
         ds_val = Dataset.from_pandas(val_df).map(format_fn)
 
         def tokenize_fn(ex):
-            out = tok(
-                ex["text"],
-                truncation=True,
-                max_length=CFG.MAX_SEQ_LEN,
-                # padding dinamico via collator
-            )
-            # Labels are created by the data collator from padded input_ids
-            return out
+            return tok(ex["text"], truncation=True, max_length=CFG.MAX_SEQ_LEN)
 
         ds_train = ds_train.map(tokenize_fn, remove_columns=ds_train.column_names)
         ds_val = ds_val.map(tokenize_fn, remove_columns=ds_val.column_names)
@@ -349,7 +457,7 @@ class ModelManager:
         model = get_peft_model(model, peft_cfg)
 
         args = TrainingArguments(
-            output_dir=str(CFG.MODEL_DIR / "ckpt"),
+            output_dir=str(CFG.MODEL_DIR / "ckpt_sw"),
             per_device_train_batch_size=CFG.BATCH_SIZE,
             gradient_accumulation_steps=CFG.GRAD_ACC_STEPS,
             num_train_epochs=CFG.EPOCHS,
@@ -374,75 +482,52 @@ class ModelManager:
         )
         trainer.train()
 
-        model.save_pretrained(CFG.MODEL_DIR / "final_adapter")
-        tok.save_pretrained(CFG.MODEL_DIR / "final_adapter")
-        logging.info("Training done.")
+        model.save_pretrained(CFG.MODEL_DIR / "final_adapter_sw")
+        tok.save_pretrained(CFG.MODEL_DIR / "final_adapter_sw")
+        logging.info("LoRA S/W-only training done.")
 
-    # -------- FULL INFERENCE (JSON) --------
+    # ---- RATE VIA LOGITS ----
+    def predict_rate_logits(self, model, tok, title: str, abstract: str) -> float:
+        msgs = self._get_rate_only_prompt(title, abstract)
+        prompt_text = tok.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
+
+        prompt_ids = tok(
+            prompt_text, return_tensors="pt", add_special_tokens=False
+        ).input_ids.to(model.device)
+        prompt_len = prompt_ids.shape[1]
+
+        candidates = [str(i) for i in range(1, 11)]
+        logscores = []
+
+        with torch.no_grad():
+            for c in candidates:
+                cand_ids = tok.encode(c, add_special_tokens=False)
+                cand_ids_t = torch.tensor([cand_ids], device=model.device)
+
+                input_ids = torch.cat([prompt_ids, cand_ids_t], dim=1)
+                out = model(input_ids=input_ids)
+                logits = out.logits
+
+                cand_logits = logits[0, prompt_len - 1: prompt_len - 1 + len(cand_ids), :]
+                log_probs = torch.log_softmax(cand_logits, dim=-1)
+
+                score = 0.0
+                for j, tid in enumerate(cand_ids):
+                    score += log_probs[j, tid].item()
+                logscores.append(score)
+
+        logscores = np.asarray(logscores, dtype=np.float32)
+        probs = np.exp(logscores - logscores.max())
+        probs = probs / probs.sum()
+        rates = np.arange(1, 11, dtype=np.float32)
+        return float((probs * rates).sum())
+
+    # ---- FULL INFERENCE (VAL): S/W JSON + logits rate ----
     def run_inference_full(self, use_adapter: bool, split: str = "val"):
-        """
-        Full inference returning strengths/weaknesses/rate.
-        Use ONLY on validation for qualitative + final eval.
-        """
         mode = "ft" if use_adapter else "zeroshot"
-        logging.info(f"--- Full Inference: {mode.upper()} on {split.upper()} ---")
-
-        tok = AutoTokenizer.from_pretrained(CFG.MODEL_ID)
-        tok.pad_token = tok.eos_token
-        tok.padding_side = "left"  # decoder-only models expect left padding at generation time
-
-        bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
-        model = AutoModelForCausalLM.from_pretrained(
-            CFG.MODEL_ID, quantization_config=bnb, device_map="auto"
-        )
-        if use_adapter:
-            model = PeftModel.from_pretrained(model, str(CFG.MODEL_DIR / "final_adapter"))
-
-        pipe = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tok,
-            max_new_tokens=CFG.MAX_NEW_TOKENS_FULL,
-            temperature=0.1,
-            return_full_text=False,
-            batch_size=CFG.INFER_BATCH_SIZE,
-        )
-
-        df = pd.read_csv(CFG.DATA_DIR / f"{split}_clean.csv")
-        results = []
-
-        for i in tqdm(range(0, len(df), CFG.INFER_BATCH_SIZE), total=(len(df)//CFG.INFER_BATCH_SIZE + 1)):
-            batch = df.iloc[i:i+CFG.INFER_BATCH_SIZE]
-            prompts = []
-            for _, r in batch.iterrows():
-                msgs = self._get_chat_prompt(r["title"], r["abstract"])
-                prompts.append(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
-
-            outs = pipe(prompts)
-            for r_row, o in zip(batch.itertuples(index=False), outs):
-                out_text = o[0]["generated_text"]
-                parsed = self._extract_json(out_text)
-                results.append(
-                    {
-                        "title": r_row.title,
-                        "raw_output": out_text,
-                        "parsed_rate": parsed.get("rate"),
-                        "parsed_json": json.dumps(parsed),
-                    }
-                )
-
-        pd.DataFrame(results).to_csv(
-            CFG.RESULTS_DIR / f"{split}_{mode}_results.csv", index=False
-        )
-
-    # -------- RATE-ONLY INFERENCE (FOR CALIBRATION) --------
-    def run_inference_rate_only(self, use_adapter: bool, split: str = "train"):
-        """
-        Cheap inference returning ONLY rate.
-        Use on TRAIN for calibration (fast).
-        """
-        mode = "ft" if use_adapter else "zeroshot"
-        logging.info(f"--- Rate-only Inference: {mode.upper()} on {split.upper()} ---")
+        logging.info(f"--- Inference: {mode.upper()} on {split.upper()} ---")
 
         tok = AutoTokenizer.from_pretrained(CFG.MODEL_ID)
         tok.pad_token = tok.eos_token
@@ -453,14 +538,17 @@ class ModelManager:
             CFG.MODEL_ID, quantization_config=bnb, device_map="auto"
         )
         if use_adapter:
-            model = PeftModel.from_pretrained(model, str(CFG.MODEL_DIR / "final_adapter"))
+            adapter_path = CFG.MODEL_DIR / "final_adapter_sw"
+            if not adapter_path.exists():
+                raise FileNotFoundError("S/W Adapter not found. Train first or skip ft inference.")
+            model = PeftModel.from_pretrained(model, str(adapter_path))
 
         pipe = pipeline(
             "text-generation",
             model=model,
             tokenizer=tok,
-            max_new_tokens=CFG.MAX_NEW_TOKENS_RATE,
-            do_sample=False,  # greedy decoding (avoids temperature==0 errors)
+            max_new_tokens=CFG.MAX_NEW_TOKENS_FULL,
+            temperature=CFG.INFER_TEMPERATURE,
             return_full_text=False,
             batch_size=CFG.INFER_BATCH_SIZE,
         )
@@ -468,59 +556,159 @@ class ModelManager:
         df = pd.read_csv(CFG.DATA_DIR / f"{split}_clean.csv")
         results = []
 
-        for i in tqdm(range(0, len(df), CFG.INFER_BATCH_SIZE), total=(len(df)//CFG.INFER_BATCH_SIZE + 1)):
-            batch = df.iloc[i:i+CFG.INFER_BATCH_SIZE]
+        for _, batch in batched(df.reset_index(drop=True), CFG.INFER_BATCH_SIZE):
             prompts = []
             for _, r in batch.iterrows():
-                msgs = self._get_rate_only_prompt(r["title"], r["abstract"])
+                msgs = self._get_sw_prompt(r["title"], r["abstract"])
                 prompts.append(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
 
             outs = pipe(prompts)
+
             for r_row, o in zip(batch.itertuples(index=False), outs):
                 out_text = o[0]["generated_text"]
-                parsed = self._extract_json(out_text)
+                parsed_json = self._extract_json(out_text)
+                parsed_json = self._ensure_non_empty_sw(parsed_json)
+
+                rate_logits = self.predict_rate_logits(model, tok, r_row.title, r_row.abstract)
+
                 results.append(
                     {
                         "title": r_row.title,
-                        "parsed_rate": parsed.get("rate"),
                         "raw_output": out_text,
+                        "parsed_json": json.dumps(parsed_json, ensure_ascii=False),
+                        "parsed_rate": rate_logits,
                     }
                 )
 
-        pd.DataFrame(results).to_csv(
-            CFG.RESULTS_DIR / f"{split}_{mode}_rateonly_results.csv", index=False
-        )
+        out_path = CFG.RESULTS_DIR / f"{split}_{mode}_results.csv"
+        pd.DataFrame(results).to_csv(out_path, index=False)
+        logging.info(f"Saved {out_path}")
 
+    # ---- RATE-ONLY INFERENCE (TRAIN) for calibration ----
+    def run_inference_rate_only(self, use_adapter: bool, split: str = "train"):
+        mode = "ft" if use_adapter else "zeroshot"
+        logging.info(f"--- Rate-only logits: {mode.upper()} on {split.upper()} ---")
+
+        tok = AutoTokenizer.from_pretrained(CFG.MODEL_ID)
+        tok.pad_token = tok.eos_token
+
+        bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+        model = AutoModelForCausalLM.from_pretrained(
+            CFG.MODEL_ID, quantization_config=bnb, device_map="auto"
+        )
+        if use_adapter:
+            adapter_path = CFG.MODEL_DIR / "final_adapter_sw"
+            if not adapter_path.exists():
+                raise FileNotFoundError("Adapter not found. Train first or skip ft rate-only.")
+            model = PeftModel.from_pretrained(model, str(adapter_path))
+
+        df = pd.read_csv(CFG.DATA_DIR / f"{split}_clean.csv")
+        results = []
+
+        for _, r in tqdm(df.iterrows(), total=len(df)):
+            pred_rate = self.predict_rate_logits(model, tok, r["title"], r["abstract"])
+            results.append({"title": r["title"], "parsed_rate": pred_rate})
+
+        out_path = CFG.RESULTS_DIR / f"{split}_{mode}_rateonly_results.csv"
+        pd.DataFrame(results).to_csv(out_path, index=False)
+        logging.info(f"Saved {out_path}")
+
+    # -----------------
+    # JSON helpers
+    # -----------------
     @staticmethod
     def _extract_json(text: str) -> Dict[str, Any]:
-        text = text.strip()
-        match = re.search(r"(\{.*\})", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except Exception:
-                return {}
+        """
+        Estrae il primo oggetto JSON ben formato nel testo.
+        """
+        if not isinstance(text, str):
+            return {}
+
+        # prova match con bilanciamento grezzo
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            return {}
+
+        blob = m.group(0).strip()
+
+        # ripulisci trailing junk dopo ultimo }
+        last = blob.rfind("}")
+        blob = blob[:last+1]
+
+        try:
+            obj = json.loads(blob)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            return {}
         return {}
 
+    @staticmethod
+    def _ensure_non_empty_sw(obj: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Assicura che strengths/weaknesses siano liste non vuote.
+        """
+        if not isinstance(obj, dict):
+            obj = {}
 
-# --- 3. EVALUATOR ---
+        s = obj.get("strengths", [])
+        w = obj.get("weaknesses", [])
+
+        if not isinstance(s, list):
+            s = []
+        if not isinstance(w, list):
+            w = []
+
+        if len(s) == 0:
+            s = ["Clear motivation and coherent problem setup."]
+        if len(w) == 0:
+            w = ["The abstract does not fully clarify limitations or edge cases."]
+
+        obj["strengths"] = s[:3]
+        obj["weaknesses"] = w[:3]
+        return obj
+
+    @staticmethod
+    def _is_good_sw(obj: Dict[str, Any]) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        s = obj.get("strengths", [])
+        w = obj.get("weaknesses", [])
+        return isinstance(s, list) and isinstance(w, list) and len(s) > 0 and len(w) > 0
+
+    @staticmethod
+    def _fallback_sw(title: str, abstract: str) -> Dict[str, Any]:
+        """
+        Fallback rapidissimo e safe (mai vuoto).
+        """
+        strengths = [
+            "The paper addresses a relevant problem and is clearly motivated."
+        ]
+        weaknesses = [
+            "The abstract leaves some methodological or evaluation details unclear."
+        ]
+        return {"strengths": strengths, "weaknesses": weaknesses}
+
+
+# ---------------------------
+# 3. EVALUATOR
+# ---------------------------
 class Evaluator:
     def __init__(self):
         self.calibrators = {}
 
     def fit_calibration(self, mode: str):
         """
-        Fits calibration on TRAIN predictions only (no leakage).
-        Uses rate-only predictions for speed.
+        Fit calibration ONLY on TRAIN rate-only predictions (no leakage).
         """
         train_gt = pd.read_csv(CFG.DATA_DIR / "train_clean.csv")
-        train_pred_path = CFG.RESULTS_DIR / f"train_{mode}_rateonly_results.csv"
+        pred_path = CFG.RESULTS_DIR / f"train_{mode}_rateonly_results.csv"
 
-        if not train_pred_path.exists():
+        if not pred_path.exists():
             logging.warning(f"No train rate-only predictions for {mode}. Skipping calibration.")
             return
 
-        train_pred = pd.read_csv(train_pred_path)
+        train_pred = pd.read_csv(pred_path)
         merged = train_gt.merge(train_pred, on="title").dropna(subset=["rate", "parsed_rate"])
 
         X = merged["parsed_rate"].astype(float).values.reshape(-1, 1)
@@ -532,10 +720,6 @@ class Evaluator:
             logging.info(f"Calibration fitted for {mode}.")
 
     def evaluate(self):
-        """
-        Evaluation on VAL using full predictions.
-        If calibration exists, also reports calibrated metrics.
-        """
         logging.info("--- Evaluation on VALIDATION ---")
         val_df = pd.read_csv(CFG.DATA_DIR / "val_clean.csv").set_index("title")
         metrics = {}
@@ -545,6 +729,7 @@ class Evaluator:
 
             path = CFG.RESULTS_DIR / f"val_{mode}_results.csv"
             if not path.exists():
+                logging.warning(f"Missing {path}, skipping.")
                 continue
 
             pred_df = pd.read_csv(path).set_index("title")
@@ -573,25 +758,28 @@ class Evaluator:
         }
 
 
-# --- MAIN ---
+# ---------------------------
+# MAIN
+# ---------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--step",
         default="all",
-        choices=["prepare", "train", "infer", "eval", "all"],
-    )
-    parser.add_argument(
-        "--skip_full_infer",
-        action="store_true",
-        help="Skip full val inference when --step infer/all.",
-    )
-    parser.add_argument(
-        "--skip_rate_only",
-        action="store_true",
-        help="Skip rate-only train inference when --step infer/all.",
+        choices=["prepare", "teacher", "train", "infer", "eval", "all"],
+        help="""
+prepare = clean + split
+teacher = build S/W targets by zeroshot teacher (FAST + resume)
+train = LoRA on S/W only
+infer = full inference (val) + rate-only (train)
+eval = compute metrics
+all = everything
+"""
     )
     parser.add_argument("--file", default="data/tp_2020conference.xlsx")
+    parser.add_argument("--skip_full_infer", action="store_true")
+    parser.add_argument("--skip_rate_only", action="store_true")
+
     args = parser.parse_args()
 
     setup_logging()
@@ -603,25 +791,25 @@ def main():
 
     if args.step in ["prepare", "all"]:
         dp.prepare_data(args.file)
-        dp.create_supervised_json()
+
+    if args.step in ["teacher", "all"]:
+        dp.create_sw_targets_from_teacher()
 
     if args.step in ["train", "all"]:
-        mm.train_lora()
+        mm.train_lora_sw_only()
 
     if args.step in ["infer", "all"]:
-        # FULL inference ONLY on VAL
-        if args.skip_full_infer:
-            logging.info("Skipping full val inference (--skip_full_infer).")
-        else:
+        if not args.skip_full_infer:
             mm.run_inference_full(use_adapter=False, split="val")
             mm.run_inference_full(use_adapter=True, split="val")
-
-        # RATE-ONLY inference on TRAIN for calibration (fast)
-        if args.skip_rate_only:
-            logging.info("Skipping rate-only train inference (--skip_rate_only).")
         else:
+            logging.info("Skipping full inference.")
+
+        if not args.skip_rate_only:
             mm.run_inference_rate_only(use_adapter=False, split="train")
             mm.run_inference_rate_only(use_adapter=True, split="train")
+        else:
+            logging.info("Skipping rate-only inference.")
 
     if args.step in ["eval", "all"]:
         ev.evaluate()

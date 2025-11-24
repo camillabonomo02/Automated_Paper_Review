@@ -1,8 +1,0 @@
-{
-  "python": "3.12.9",
-  "torch": "2.2.2+cu121",
-  "cuda_available": true,
-  "device": "Tesla V100-PCIE-16GB",
-  "seed": 42,
-  "timestamp": "2025-11-18T16:57:05.817346"
-}
