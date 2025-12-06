@@ -86,6 +86,9 @@ class Config:
     # Per aderire al tuo obiettivo (estrarre S/W dalle review), conviene usarla sempre.
     MIX_USE_REVIEW_PROB = 1.0
 
+    # Calibration
+    CALIB_TRAIN_MAX_EXAMPLES = 1000
+
     # Retry policy JSON teacher
     TEACHER_RETRY_MAX = 2
     TEACHER_RETRY_TOKENS_BOOST = 80  # se fallisce, aumenta tokens così
@@ -738,6 +741,16 @@ class ModelManager:
             model = PeftModel.from_pretrained(model, str(adapter_path))
 
         df = pd.read_csv(CFG.DATA_DIR / f"{split}_clean.csv")
+
+        # per la calibrazione ci basta un subset del TRAIN
+        if split == "train" and CFG.CALIB_TRAIN_MAX_EXAMPLES is not None:
+            if len(df) > CFG.CALIB_TRAIN_MAX_EXAMPLES:
+                logging.info(
+                    f"Subsampling TRAIN for rate-only from {len(df)} "
+                    f"to {CFG.CALIB_TRAIN_MAX_EXAMPLES} examples."
+                )
+                df = df.sample(CFG.CALIB_TRAIN_MAX_EXAMPLES, random_state=CFG.SEED).reset_index(drop=True)
+
         results = []
 
         logging.info(f"Running rate-only inference on {len(df)} examples...")
