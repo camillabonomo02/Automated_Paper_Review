@@ -8,6 +8,11 @@ import argparse
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 
+import ast
+from typing import Tuple
+from numpy.linalg import norm
+from sentence_transformers import SentenceTransformer
+
 import numpy as np
 import pandas as pd
 import torch
@@ -918,6 +923,229 @@ class Evaluator:
             "Pearson": float(pearsonr(yt, yp)[0]) if len(yt) > 1 else 0.0,
         }
 
+# ---------------------------
+# 4. S/W QUALITY EVALUATOR
+# ---------------------------
+class SWQualityEvaluator:
+    """
+    Valuta la qualità delle Strengths/Weaknesses generate:
+
+    - Percentuale di fallback (S/W uguale alle frasi di default)
+    - Diversità lessicale normalizzata dei bullet
+    - Similarità (cosine) tra Teacher S/W e ZS / FT (semi-automatica)
+    """
+
+    # frasi di fallback definite in ModelManager._fallback_sw
+    FALLBACK_STRENGTH = "The paper addresses a relevant problem and is clearly motivated."
+    FALLBACK_WEAKNESS = "The abstract leaves some methodological or evaluation details unclear."
+
+    def __init__(self):
+        # modello di embedding leggero (se disponibile)
+        if SentenceTransformer is not None:
+            self.embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        else:
+            self.embedder = None
+
+    # ---------- helper per parsing JSON ----------
+
+    @staticmethod
+    def _load_sw_from_json_str(js: str) -> Tuple[list, list]:
+        """
+        Prende una stringa JSON e restituisce (strengths, weaknesses) come liste di stringhe.
+        Se il JSON è rotto o manca, restituisce liste vuote.
+        """
+        if not isinstance(js, str) or js.strip() == "":
+            return [], []
+        try:
+            obj = json.loads(js)
+        except Exception:
+            # a volte i CSV possono avere doppi apici incasinati, riprova con ast.literal_eval
+            try:
+                obj = ast.literal_eval(js)
+            except Exception:
+                return [], []
+
+        s = obj.get("strengths", [])
+        w = obj.get("weaknesses", [])
+
+        if isinstance(s, str):
+            s = [s]
+        if isinstance(w, str):
+            w = [w]
+
+        # filtra eventuali elementi non stringa
+        s = [str(x).strip() for x in s if str(x).strip()]
+        w = [str(x).strip() for x in w if str(x).strip()]
+        return s, w
+
+    @classmethod
+    def _is_fallback(cls, strengths: list, weaknesses: list) -> bool:
+        """
+        Consideriamo fallback i casi in cui:
+        - c'è esattamente 1 strength = frase default
+        - c'è esattamente 1 weakness = frase default
+        """
+        return (
+            len(strengths) == 1
+            and len(weaknesses) == 1
+            and strengths[0] == cls.FALLBACK_STRENGTH
+            and weaknesses[0] == cls.FALLBACK_WEAKNESS
+        )
+
+    @staticmethod
+    def _lexical_diversity(bullets: list) -> float:
+        """
+        Diversità lessicale normalizzata:
+        |vocab| / |tokens|.
+        Ritorna 0.0 se non ci sono token.
+        """
+        text = " ".join(bullets).strip()
+        if not text:
+            return 0.0
+        # split banale su spazio -> sufficiente per una misura globale
+        tokens = text.split()
+        if not tokens:
+            return 0.0
+        vocab = set(tokens)
+        return len(vocab) / len(tokens)
+
+    def _encode(self, texts: list) -> np.ndarray:
+        """
+        Codifica una lista di stringhe in un embedding medio.
+        Se l'embedder non è disponibile, restituisce None.
+        """
+        if self.embedder is None or not texts:
+            return None
+        emb = self.embedder.encode(texts, convert_to_numpy=True)
+        if emb.ndim == 1:
+            return emb
+        return emb.mean(axis=0)
+
+    @staticmethod
+    def _cosine(u: np.ndarray, v: np.ndarray) -> Optional[float]:
+        if u is None or v is None:
+            return None
+        nu, nv = norm(u), norm(v)
+        if nu == 0.0 or nv == 0.0:
+            return None
+        return float(np.dot(u, v) / (nu * nv))
+
+    # ---------- main evaluation ----------
+
+    def evaluate_sw_quality(self) -> Dict[str, Any]:
+        """
+        Valuta la qualità delle S/W su VALIDATION.
+
+        Usa:
+        - teacher S/W da val_sw_targets.csv
+        - predizioni zero-shot da val_zeroshot_results.csv
+        - predizioni fine-tuned da val_ft_results.csv
+        """
+        logging.info("--- S/W QUALITY EVALUATION on VALIDATION ---")
+
+        # Teacher S/W su validation (potrebbe essere un subset)
+        teacher_path = CFG.DATA_DIR / "val_sw_targets.csv"
+        zs_path = CFG.RESULTS_DIR / "val_zeroshot_results.csv"
+        ft_path = CFG.RESULTS_DIR / "val_ft_results.csv"
+
+        if not (teacher_path.exists() and zs_path.exists() and ft_path.exists()):
+            logging.warning(
+                "Missing one of val_sw_targets.csv / val_zeroshot_results.csv / val_ft_results.csv. "
+                "Skipping S/W quality evaluation."
+            )
+            return {}
+
+        df_teacher = pd.read_csv(teacher_path)[["title", "target_json"]].set_index("title")
+        df_zs = pd.read_csv(zs_path)[["title", "parsed_json"]].set_index("title")
+        df_ft = pd.read_csv(ft_path)[["title", "parsed_json"]].set_index("title")
+
+        # Consideriamo solo l'intersezione dei titoli presenti in tutte e tre
+        common_titles = df_teacher.index.intersection(df_zs.index).intersection(df_ft.index)
+
+        if len(common_titles) == 0:
+            logging.warning("No overlapping titles between teacher, zeroshot and ft on validation.")
+            return {}
+
+        logging.info(f"Evaluating S/W quality on {len(common_titles)} validation examples.")
+
+        n = len(common_titles)
+
+        # Counters per metriche globali
+        fallback_zs = 0
+        fallback_ft = 0
+
+        bullets_zs = []
+        bullets_ft = []
+
+        sims_teacher_zs = []
+        sims_teacher_ft = []
+
+        for title in tqdm(common_titles, desc="S/W quality val"):
+            # --- teacher ---
+            t_s, t_w = self._load_sw_from_json_str(df_teacher.loc[title, "target_json"])
+            txt_teacher = "Strengths: " + " ".join(t_s) + " Weaknesses: " + " ".join(t_w)
+
+            # --- zeroshot ---
+            zs_s, zs_w = self._load_sw_from_json_str(df_zs.loc[title, "parsed_json"])
+            if self._is_fallback(zs_s, zs_w):
+                fallback_zs += 1
+            bullets_zs.extend(zs_s + zs_w)
+            txt_zs = "Strengths: " + " ".join(zs_s) + " Weaknesses: " + " ".join(zs_w)
+
+            # --- fine-tuned ---
+            ft_s, ft_w = self._load_sw_from_json_str(df_ft.loc[title, "parsed_json"])
+            if self._is_fallback(ft_s, ft_w):
+                fallback_ft += 1
+            bullets_ft.extend(ft_s + ft_w)
+            txt_ft = "Strengths: " + " ".join(ft_s) + " Weaknesses: " + " ".join(ft_w)
+
+            # --- embedding-based similarity (se disponibile) ---
+            if self.embedder is not None:
+                emb_teacher = self._encode([txt_teacher])
+                emb_zs = self._encode([txt_zs])
+                emb_ft = self._encode([txt_ft])
+
+                sim_t_zs = self._cosine(emb_teacher, emb_zs)
+                sim_t_ft = self._cosine(emb_teacher, emb_ft)
+
+                if sim_t_zs is not None:
+                    sims_teacher_zs.append(sim_t_zs)
+                if sim_t_ft is not None:
+                    sims_teacher_ft.append(sim_t_ft)
+
+        # --- metriche globali ---
+        fallback_rate_zs = fallback_zs / n
+        fallback_rate_ft = fallback_ft / n
+
+        diversity_zs = self._lexical_diversity(bullets_zs)
+        diversity_ft = self._lexical_diversity(bullets_ft)
+
+        metrics = {
+            "n_examples": n,
+            "fallback_rate": {
+                "zeroshot": float(fallback_rate_zs),
+                "ft": float(fallback_rate_ft),
+            },
+            "lexical_diversity": {
+                "zeroshot": float(diversity_zs),
+                "ft": float(diversity_ft),
+            },
+        }
+
+        if sims_teacher_zs and sims_teacher_ft:
+            metrics["teacher_similarity_cosine"] = {
+                "zeroshot": float(np.mean(sims_teacher_zs)),
+                "ft": float(np.mean(sims_teacher_ft)),
+            }
+
+        logging.info("S/W quality metrics:\n" + json.dumps(metrics, indent=2))
+
+        out_path = CFG.RESULTS_DIR / "sw_quality_metrics.json"
+        with open(out_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        logging.info(f"Saved {out_path}")
+
+        return metrics
 
 # ---------------------------
 # MAIN
@@ -949,6 +1177,7 @@ all = everything
     dp = DataProcessor()
     mm = ModelManager()
     ev = Evaluator()
+    sw_ev = SWQualityEvaluator()
 
     if args.step in ["prepare", "all"]:
         dp.prepare_data(args.file)
@@ -974,6 +1203,7 @@ all = everything
 
     if args.step in ["eval", "all"]:
         ev.evaluate()
+        sw_ev.evaluate_sw_quality()
 
 
 if __name__ == "__main__":

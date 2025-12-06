@@ -1,0 +1,15 @@
+{
+  "n_examples": 289,
+  "fallback_rate": {
+    "zeroshot": 0.0,
+    "ft": 0.0
+  },
+  "lexical_diversity": {
+    "zeroshot": 0.22526982066055343,
+    "ft": 0.19986521613555405
+  },
+  "teacher_similarity_cosine": {
+    "zeroshot": 0.5412110289056048,
+    "ft": 0.5117889861576259
+  }
+}
