@@ -1,153 +1,178 @@
 # Fine-Tuning a Small LLM with LoRA for Automated Paper Review Insights
 
-This repository contains the implementation and experiments for the project "Fine-tuning a Small LLM with LoRA for Automated Paper Review Insights", which explores whether a lightweight fine-tuned language model can assist in the peer review process by generating structured evaluations of scientific papers.
-
-The work focuses on automated generation of paper strengths and weaknesses, along with numeric rating and confidence predictions, using a LoRA fine-tuned LLaMA 3.2B model.
+This repository provides an end-to-end, scriptable workflow for transforming raw OpenReview-style conference data into structured reviewer insights.  
+The pipeline extracts cleaned examples, distills strengths/weaknesses with a zero-shot teacher, fine-tunes a lightweight LLaMA 3.2B model via LoRA, and evaluates both textual and numeric review quality.
 
 ---
 
 ## Project Overview
 
-Peer reviewing is a cornerstone of scientific communication but remains time-consuming and inconsistent.  
-This project investigates how parameter-efficient fine-tuning (LoRA) can be used to adapt a small LLM to generate structured, interpretable peer reviews, even with a limited dataset.  
+Peer review remains essential yet inconsistent. Here we explore whether a compact LoRA-adapted LLM can:
 
-Specifically, it compares:
-- **Zero-shot generation** (baseline performance of the pretrained model)
-- **Fine-tuned generation** (LoRA-adapted model on human-written reviews)
+- Summarize papers into concise **strengths** and **weaknesses** bullet lists.
+- Produce an approximate **overall rating** on the 1–10 OpenReview scale.
+- Improve upon zero-shot behavior while staying cheap to train (4-bit quantization, LoRA adapters only).
 
-Evaluation is conducted on both textual and numerical levels, using regression and semantic metrics.
+The main script `run_experiment.py` orchestrates five sequential steps:
+1. Prepare cleaned train/validation splits.
+2. Distill structured S/W targets with a zero-shot “teacher”.
+3. Fine-tune the student model on the teacher JSON outputs.
+4. Run inference (structured JSON + rating logits) and rate-only calibration passes.
+5. Evaluate numeric metrics plus S/W quality diagnostics.
 
 ---
 
 ## Repository Structure
+
 ```
-├── data/
-│ ├── tp_2017conference.xlsx # Original OpenReview dataset (2017)
-│ ├── train.csv # Cleaned training split
-│ ├── val.csv # Validation split
-│ ├── test.csv # Test split
-│ ├── train_structured.csv # Zero-shot distilled structured reviews (train set)
-│ └── val_structured.csv # Zero-shot distilled structured reviews (validation set)
-│
-├── notebooks/
-│ ├── main.ipynb # Main training + evaluation pipeline
-│ ├── dataset_stats.ipynb # Dataset exploration and token analysis
-│
-├── model/
-│ ├── finetuned-llama3/ # Model outputs and checkpoints
-│ └── finetuned-llama3-lora/ # Final fine-tuned LoRA weights
-│
-├── output/
-│ ├── zero_shot_predictions.csv # Model predictions before fine-tuning
-│ └── finetuned_predictions.csv # Model predictions after fine-tuning
-│
-├── Fine-tuning a Small LLM with LoRA for Automated Paper Review Insights.pdf
-├── requirements.txt
-└── README.md
+├── data/                # Raw spreadsheets + derived CSV splits + teacher targets
+├── model/               # Saved LoRA adapters (final_adapter_sw) and HF checkpoints
+├── results/             # Inference outputs, calibration runs, evaluation metrics
+├── requirements.txt     # Runtime dependencies for the pipeline
+└── run_experiment.py    # Single entry point for every stage
 ```
+
+`data/` should contain your original spreadsheet (e.g., `tp_2020conference.xlsx`).  
+Every other artifact (`*_clean.csv`, `*_sw_targets.csv`, results CSVs, and metrics) is auto-generated inside these folders.
+
 ---
+
 ## Setup Instructions
 
-### 1. Connect to your VM
-Access your instance via the Azure portal at [labs.azure.com/virtualmachines](https://labs.azure.com/virtualmachines).  
-You can open **VS Code → Remote Explorer → Connect to Host**.
+1. **Clone the repo**
+   ```bash
+   git clone https://github.com/camillabonomo02/Automated_Paper_Review.git
+   cd Automated_Paper_Review
+   ```
+2. **Create a Python environment (recommended 3.10+) and install deps**
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+3. **Log in to Hugging Face**
+- CLI alternative:
+  ```bash
+  huggingface-cli login
+  ```
+  or via Python:
+  ```python
+  from huggingface_hub import login
+  login("hf_your-token")
+  ```
+   - The token must have read access to `meta-llama/Llama-3.2-3B-Instruct`.
+   - Configure your environment for GPU + CUDA (4-bit inference/training relies on `bitsandbytes`).
 
-Ensure your VM includes:
-- Ubuntu 20.04+ (or similar Linux)
-- CUDA-enabled GPU
-- Python 3.10 – 3.12 environment
-
-### 2. Clone the repository
-```bash
-git clone https://github.com/camillabonomo02/Automated_Paper_Review.git
-cd Automated_Paper_Review
-```
-### 3. Install dependencies
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Authenticate with Hugging Face
-In the section of the notebook dedicated to the Hugging Face log in insert your own token. This grants access to download meta-llama/Llama-3.2-3B-Instruct.
-To generate your how token access at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and generate a fine-grained token for meta-llama\Llama 3.2-3B-Instruct and selct at least "Read acess to contents on selcted repos".
-Then log in:
-
-```python
-from huggingface_hub import login
-login("your_huggingface_token")
-```
 ---
 
-## Run the notebooks
-The dataset_stats.ipynb notebook contains a basic dataset exploration and main tokens statistics.
+## Data Requirements
 
-The main.ipynb notebook contains the entire development of the project:
+`run_experiment.py` expects a CSV or Excel file containing at least the following columns (case-insensitive):
 
-### Dataset preparation
-This cells:
+- `title`
+- `abstract`
+- `review` (free-form reviewer text)
+- One column containing a numeric or textual `rate`.
 
-- Load the tp_2017conference.xlsx dataset
+Missing or malformed rows are discarded during cleaning. Ratings are normalized to the 1–10 OpenReview scale.
 
-- Clean text fields (title, abstract, review)
+---
 
-- Extract numeric scores (rating_num, confidence_num)
+## Running the Pipeline
 
-- Split into train.csv, val.csv, and test.csv
+The entire workflow is driven by the `--step` argument. You can run each stage separately or execute everything with `--step all`.
 
-### Zero-Shot structured review generation
-The base model (LLaMA 3.2B-Instruct) generates structured reviews following a fixed prompt template.
-Outputs are saved as train_structured.csv and val_structured.csv.
+```bash
+python run_experiment.py --step <prepare|teacher|train|infer|eval|all> \
+    --file data/tp_2020conference.xlsx \
+    [--skip_full_infer] [--skip_rate_only]
+```
 
-### LoRA Fine-Tuning
-Continue in the same notebook (Fine-Tuning section), the cells:
+### 1. Prepare (`--step prepare`)
 
-- Load LLaMA 3.2B in 4-bit quantization via bitsandbytes
+- Reads the raw spreadsheet/CSV.
+- Cleans text fields, parses ratings, and splits into 80/20 train/validation (`data/train_clean.csv`, `data/val_clean.csv`).
 
-- Prepare the model using PEFT (prepare_model_for_kbit_training)
+### 2. Teacher Distillation (`--step teacher`)
 
-- Fine-tunes via LoRA adapters
+- Uses `meta-llama/Llama-3.2-3B-Instruct` in 4-bit mode to generate **strict JSON** strength/weakness targets.
+- Produces `data/train_sw_targets.csv` and `data/val_sw_targets.csv`.
+- Supports resume logic and configurable subsampling (see constants in `Config`).
 
-- Saves weights under notebooks/finetuned-llama3-lora/
+### 3. LoRA Training (`--step train`)
 
-### Generate predictions and apply to test set
-After fine-tuning, run the model to generate predictions on the test set using both zero-shot and fine-tuned models.
-These predictions will be saved in zero_shot_predictions.csv and finetuned_predictions.csv.
+- Fine-tunes the base model on the teacher JSON structures using PEFT LoRA adapters.
+- Stores outputs under `model/final_adapter_sw/` (adapter weights + tokenizer).
+- Training parameters (LR, batch size, grad acc steps, epochs) are defined in `Config`.
 
-### Evaluation
-The final cells evaluate:
+### 4. Inference (`--step infer`)
 
-- Regression metrics: MAE, RMSE, R², Pearson
-- Semantic alignment: BERTScore (F1)
+- **Full inference** on validation:
+  - Runs both zero-shot (`mode=zeroshot`) and adapter (`mode=ft`) models to produce JSON S/W predictions plus rating logits (`results/val_<mode>_results.csv`).
+- **Rate-only inference** on train (for calibration) unless `--skip_rate_only`:
+  - Produces `results/train_<mode>_rateonly_results.csv`.
+- Use `--skip_full_infer` to omit the S/W generation pass if you only need rate calibration.
 
-## Discussion
-The fine-tuned model successfully learns the review structure and improves textual alignment with human-written reviews.
-However, confidence prediction remains inconsistent, suggesting that reviewer uncertainty cannot be reliably inferred from text alone.
+### 5. Evaluation (`--step eval`)
 
+- Fits a robust regression calibration (HuberRegressor) on rate-only predictions.
+- Computes MAE, RMSE, and Pearson correlation for raw vs calibrated predictions (`results/final_metrics.json`).
+- Runs the S/W quality diagnostics:
+  - Fallback percentage (default text usage).
+  - Lexical diversity of bullets.
+  - Optional cosine similarity vs teacher outputs (if sentence-transformer embeddings are available).
+  - Metrics saved to `results/sw_quality_metrics.json`.
 
-#### Project developed by Camilla Bonomo
+### 6. All-In-One (`--step all`)
 
-"""
-Paper Review Pipeline (rate + strengths/weaknesses) — concise, proposal-aligned
+Runs every stage in sequence with default options. Ideal for fully reproducing the pipeline once requirements and data are prepared.
 
-What this script does:
-1) PREPARE: Read your Excel/CSV (Seafoodair/OpenReview 2020) and make train/val splits.
-   Required columns in the file: title, abstract, review, rate
-2) DISTILL: Ask a small LLM for STRICT JSON with {strengths[3], weaknesses[3], rate:float}.
-3) DATASETS + LORA: Build HF datasets and fine-tune with LoRA (small, fast).
-4) NUMERIC EVAL: Baselines + zero-shot regression metrics for 'rate' (MAE/RMSE/R2/Pearson + CI).
-5) HUMAN REFS: Extract human Strengths/Weaknesses from the review text (deterministic heuristic).
-6) S/W EVAL: Compare model S/W (zero-shot and distilled) to human S/W with BERTScore (± CI).
-7) PLOTS: Merge metrics and render a simple MAE plot (rate) + BERTScore plot (S/W).
+---
 
-CLI (common):
-  python paper_review_pipeline.py --step prepare --source excel --xlsx data/tp_2020conference.xlsx
-  python paper_review_pipeline.py --step distill --limit 200
-  python paper_review_pipeline.py --step buildds
-  python paper_review_pipeline.py --step finetune
-  python paper_review_pipeline.py --step baselines
-  python paper_review_pipeline.py --step zseval
-  python paper_review_pipeline.py --step refs
-  python paper_review_pipeline.py --step zssw
-  python paper_review_pipeline.py --step evalsw
-  python paper_review_pipeline.py --step plot
-"""
+## Key Configuration Options
+
+All knobs live inside the `Config` class in `run_experiment.py`. Highlights:
+
+- `MODEL_ID`: change to another chat model if needed.
+- `TEACHER_*`: token budget, batch size, retry counts, subsampling limits for distillation.
+- `MIX_USE_REVIEW_PROB`: probability of feeding the human review during student training (default = always use it).
+- `MAX_SEQ_LEN`: max tokens for HF datasets.
+- `INFER_*`: generation parameters for evaluation runs.
+- `CALIB_TRAIN_MAX_EXAMPLES`: cap on train samples used for calibration inference.
+
+Modify these constants before running the corresponding steps.
+
+---
+
+## Outputs & Artifacts
+
+| Stage      | Artifact(s)                                                       |
+|------------|------------------------------------------------------------------|
+| Prepare    | `data/train_clean.csv`, `data/val_clean.csv`                      |
+| Teacher    | `data/train_sw_targets.csv`, `data/val_sw_targets.csv`            |
+| Train      | `model/final_adapter_sw/` (LoRA adapter + tokenizer)              |
+| Inference  | `results/val_zeroshot_results.csv`, `results/val_ft_results.csv`, `results/train_<mode>_rateonly_results.csv` |
+| Evaluation | `results/final_metrics.json`, `results/sw_quality_metrics.json`   |
+
+Each inference CSV contains raw model outputs, parsed JSON, and numeric ratings for downstream analysis.
+
+---
+
+## Tips & Troubleshooting
+
+- **Accelerate + bitsandbytes**: ensure CUDA drivers and GPU memory are sufficient; 4-bit quantization keeps VRAM usage manageable (~8–10 GB).
+- **Teacher resume**: delete `data/train_sw_targets.csv` or `data/val_sw_targets.csv` if you want to regenerate from scratch.
+- **JSON parsing failures**: the teacher stage automatically retries with a stricter prompt and higher token budget; worst case it falls back to a deterministic S/W template so downstream steps never crash.
+- **SentenceTransformer optional**: if you cannot download embeddings (no GPU or HF access), S/W similarity metrics gracefully skip the embedding step.
+
+---
+
+## License & Attribution
+
+This work was developed by **Camilla Bonomo** as part of the “Fine-Tuning a Small LLM with LoRA for Automated Paper Review Insights” project.  
+Please credit the project if you build upon this codebase or release derived adapters/datasets.
+
+--- 
+
+Happy experimenting! Feel free to adapt the prompts, training recipes, or evaluation routines to match your conference or domain. 

@@ -1,4 +1,3 @@
-# run_experiment2.py
 import os
 import re
 import json
@@ -49,7 +48,7 @@ from datasets import Dataset
 class Config:
     SEED = 42
     MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct"
-    MAX_SEQ_LEN = 700  # include anche review in alcuni esempi per LoRA
+    MAX_SEQ_LEN = 700  # large enough to include the review in some LoRA samples
 
     ROOT = pathlib.Path(".").resolve()
     DATA_DIR = ROOT / "data"
@@ -63,22 +62,22 @@ class Config:
 
     # Training params
     LR = 2e-4
-    EPOCHS = 1 # forse di più
+    EPOCHS = 1  # bump upward if the adapter is undertrained
     BATCH_SIZE = 2
     GRAD_ACC_STEPS = 4
 
     # Teacher extraction (zeroshot)
-    # più bassi = più veloci; se JSON tronchi alzi solo di poco
+    # lower values === faster runs; only nudge upward if JSON outputs truncate
     TEACHER_MAX_NEW_TOKENS = 140
     TEACHER_BATCH_SIZE = 12
-    TEACHER_TEMPERATURE = 0.0     # deterministico
+    TEACHER_TEMPERATURE = 0.0     # deterministic sampling for reproducibility
     TEACHER_TOP_P = 1.0
 
-    # Fai teacher su VAL solo su un subset per risparmiare tempo
+    # Run the teacher on a subset of VAL to save time
     TEACHER_TRAIN_MAX_EXAMPLES = 500
-    TEACHER_VAL_MAX_EXAMPLES = 300  # 200
+    TEACHER_VAL_MAX_EXAMPLES = 300  
 
-    # Resume teacher: se file esiste continua
+    # Resume teacher generation if partial outputs already exist
     TEACHER_RESUME = True
 
     # Inference full
@@ -87,16 +86,16 @@ class Config:
     INFER_TEMPERATURE = 0.1
 
     # Mix prompt training
-    # Prob che un esempio includa anche la review in input
-    # Per aderire al tuo obiettivo (estrarre S/W dalle review), conviene usarla sempre.
+    # Probability that an example also includes the human review in the input
+    # Always including the review matches the goal of extracting S/W from it
     MIX_USE_REVIEW_PROB = 1.0
 
     # Calibration
     CALIB_TRAIN_MAX_EXAMPLES = 1000
 
-    # Retry policy JSON teacher
+    # Retry policy for the JSON teacher
     TEACHER_RETRY_MAX = 2
-    TEACHER_RETRY_TOKENS_BOOST = 80  # se fallisce, aumenta tokens così
+    TEACHER_RETRY_TOKENS_BOOST = 80  # add tokens after each failure to improve recovery
 
     def __init__(self):
         for d in (self.DATA_DIR, self.RESULTS_DIR, self.MODEL_DIR):
@@ -106,9 +105,7 @@ class Config:
 CFG = Config()
 
 
-# ---------------------------
 # UTILS
-# ---------------------------
 def set_seed(seed: int = CFG.SEED):
     random.seed(seed)
     np.random.seed(seed)
@@ -130,14 +127,12 @@ def batched(iterable, n):
         yield i, iterable[i:i + n]
 
 
-# ---------------------------
 # 1. DATA PROCESSOR
-# ---------------------------
 class DataProcessor:
     """
     Pipeline:
       1) load raw, clean, split train/val
-      2) create S/W teacher targets (zeroshot) su train + subset di val
+      2) create S/W teacher targets (zeroshot) on train + subset of val
       3) save train_sw_targets.csv / val_sw_targets.csv
     """
 
@@ -231,8 +226,8 @@ class DataProcessor:
 
     def create_sw_targets_from_teacher(self):
         """
-        Teacher vede title + abstract + review.
-        Usa resume e val-subset per velocità.
+        Generate teacher-produced strengths/weaknesses using title + abstract + review.
+        Resume from existing CSVs and subsample validation for speed.
         """
         logging.info("Creating S/W targets using ZERO-SHOT teacher (title+abstract+review)...")
 
@@ -263,7 +258,7 @@ class DataProcessor:
             logging.info(f"--- TEACHER on {split.upper()} ---")
             df = pd.read_csv(CFG.DATA_DIR / f"{split}_clean.csv")
 
-            # per train: limita il numero di esempi
+            # keep the teacher workload manageable on train split
             if split == "train" and CFG.TEACHER_TRAIN_MAX_EXAMPLES is not None:
                 if len(df) > CFG.TEACHER_TRAIN_MAX_EXAMPLES:
                     logging.info(
@@ -272,7 +267,7 @@ class DataProcessor:
                     )
                     df = df.sample(CFG.TEACHER_TRAIN_MAX_EXAMPLES, random_state=CFG.SEED).reset_index(drop=True)
 
-            # per val prendi solo subset (veloce)
+            # restrict validation to a subset (much faster)
             if split == "val" and CFG.TEACHER_VAL_MAX_EXAMPLES is not None:
                 if len(df) > CFG.TEACHER_VAL_MAX_EXAMPLES:
                     logging.info(
@@ -341,7 +336,7 @@ class DataProcessor:
                         "target_json": json.dumps(parsed_json, ensure_ascii=False),
                     })
 
-                # salva incrementalmente (così non perdi progresso)
+                # save incrementally so early batches are never lost
                 pd.DataFrame(rows).to_csv(out_path, index=False)
 
             logging.info(f"S/W targets created for {split}: {len(rows)} samples")
@@ -358,22 +353,22 @@ class DataProcessor:
         out_text: str
     ) -> Dict[str, Any]:
         """
-        1) parse robusto
-        2) retry se JSON rotto o liste vuote
-        3) fallback soft se ancora vuoto
+        1) Parse the teacher response.
+        2) Retry if the JSON is malformed or missing lists.
+        3) Fall back to a safe default if retries still fail.
 
-        IMPORTANTE: non chiamiamo _ensure_non_empty_sw prima di verificare
-        se il JSON è 'buono', altrimenti ogni output diventa 'buono' perché
-        le liste vengono sempre riempite con il default.
+        IMPORTANT: never call _ensure_non_empty_sw before verifying that
+        the JSON is valid, otherwise every response would look valid due
+        to injected defaults.
         """
-        # Primo tentativo: parse diretto
+        # First attempt: parse the output as-is
         parsed = mm._extract_json(out_text)
 
-        # Se è già un buon JSON (liste non vuote), applichiamo solo il "cap" a 1-3 elementi
+        # If JSON already contains non-empty lists, just cap them to 1-3 entries
         if mm._is_good_sw(parsed):
             return mm._ensure_non_empty_sw(parsed)
 
-        # Retry mirato con prompt strict + più token
+        # Retry with the stricter prompt and progressively more tokens
         for k in range(CFG.TEACHER_RETRY_MAX):
             msgs = mm._get_sw_prompt_strict(title, abstract, review)
             prompt = tok.apply_chat_template(
@@ -395,13 +390,11 @@ class DataProcessor:
             if mm._is_good_sw(parsed):
                 return mm._ensure_non_empty_sw(parsed)
 
-        # fallback: se nemmeno il retry produce JSON buono, usiamo uno S/W safe
+        # fallback: if retries fail, return a safe default S/W pair
         return mm._fallback_sw(title, abstract)
 
 
-# ---------------------------
 # 2. MODEL MANAGER
-# ---------------------------
 class ModelManager:
 
     # ---- PROMPTS ----
@@ -414,7 +407,7 @@ class ModelManager:
             "9-10 = strong accept."
         )
 
-    # Prompt TEACHER S/W: usa anche la review umana
+    # Prompt TEACHER S/W: also feeds the human review
     def _get_sw_teacher_prompt(self, title: str, abstract: str, review: str) -> List[Dict]:
         sys_msg = (
             "You are an expert reviewer. Read the title, abstract, and full review. "
@@ -433,7 +426,7 @@ class ModelManager:
             {"role": "user", "content": user_msg},
         ]
 
-    # base prompt S/W (title+abstract only) - eventualmente riutilizzabile
+    # Base prompt using title + abstract only, reusable elsewhere
     def _get_sw_prompt(self, title: str, abstract: str) -> List[Dict]:
         sys_msg = (
             "You are an expert reviewer. Analyze the title and abstract. "
@@ -446,7 +439,7 @@ class ModelManager:
         return [{"role": "system", "content": sys_msg},
                 {"role": "user", "content": user_msg}]
 
-    # stricter prompt per retries del TEACHER (usa anche la review)
+    # Stricter prompt for teacher retries, still includes the review
     def _get_sw_prompt_strict(self, title: str, abstract: str, review: str) -> List[Dict]:
         sys_msg = (
             "You are an expert reviewer. "
@@ -464,7 +457,7 @@ class ModelManager:
         return [{"role": "system", "content": sys_msg},
                 {"role": "user", "content": user_msg}]
 
-    # Prompt TRAIN S/W con review in input (mix controllato da MIX_USE_REVIEW_PROB)
+    # Prompt used to train S/W extraction with optional review input
     def _get_sw_train_prompt(
         self, title: str, abstract: str, review: str, use_review: bool
     ) -> List[Dict]:
@@ -486,7 +479,7 @@ class ModelManager:
         return [{"role": "system", "content": sys_msg},
                 {"role": "user", "content": user_msg}]
 
-    # Prompt S/W per INFERENZA (title + abstract + review)
+    # Prompt used at inference time (title + abstract + review)
     def _get_sw_infer_prompt(self, title: str, abstract: str, review: str) -> List[Dict]:
         sys_msg = (
             "You are an expert reviewer. "
@@ -502,11 +495,11 @@ class ModelManager:
         return [{"role": "system", "content": sys_msg},
                 {"role": "user", "content": user_msg}]
 
-    # Prompt rate-only per logits (usa review)
+    # Prompt used to derive rating logits (also consumes the review)
     def _get_rate_only_prompt(self, title: str, abstract: str, review: str = "") -> List[Dict]:
         """
-        Prompt per predire SOLO il rate. Usiamo title + abstract + full review,
-        ma il formato di output resta un JSON minimal: {'rate': number between 1 and 10}.
+        Prompt for predicting the numeric rate only. Uses title + abstract + review
+        but expects a minimal JSON: {'rate': number between 1 and 10}.
         """
         sys_msg = (
             "You are an expert reviewer. "
@@ -521,10 +514,10 @@ class ModelManager:
         return [{"role": "system", "content": sys_msg},
                 {"role": "user", "content": user_msg}]
 
-    # ---- TRAIN LORA ON SW STRUCTURE ----
+    # Train LoRA adapter on S/W targets
     def train_lora_sw_only(self):
         """
-        LoRA per imparare SOLO struttura S/W teacher-style.
+        LoRA training focused purely on matching the teacher S/W JSON format.
         """
         logging.info("--- Starting LoRA Training on S/W JSON targets ---")
 
@@ -602,12 +595,12 @@ class ModelManager:
         tok.save_pretrained(CFG.MODEL_DIR / "final_adapter_sw")
         logging.info("LoRA S/W-only training done.")
 
-    # ---- RATE VIA LOGITS ----
+    # Rate via logits
     def predict_rate_logits(self, model, tok, title: str, abstract: str, review: str = "") -> float:
         """
-        Predice un rate in [1,10] usando solo i logits del modello sui token '1'..'10',
-        a partire da title + abstract + full review.
-        Il fine-tuning LoRA influenza indirettamente questi logits.
+        Predict a rate in [1, 10] using only the model logits on tokens '1'..'10'
+        conditioned on title + abstract + review. LoRA finetuning indirectly
+        shifts these logits.
         """
         msgs = self._get_rate_only_prompt(title, abstract, review)
         prompt_text = tok.apply_chat_template(
@@ -645,7 +638,7 @@ class ModelManager:
         rates = np.arange(1, 11, dtype=np.float32)
         return float((probs * rates).sum())
 
-    # ---- FULL INFERENCE (VAL): S/W JSON + logits rate ----
+    # Full inference (S/W + rate)
     def run_inference_full(self, use_adapter: bool, split: str = "val"):
         mode = "ft" if use_adapter else "zeroshot"
         logging.info(f"--- Inference: {mode.upper()} on {split.upper()} (S/W + rate) ---")
@@ -727,7 +720,7 @@ class ModelManager:
         pd.DataFrame(results).to_csv(out_path, index=False)
         logging.info(f"Saved {out_path}")
 
-    # ---- RATE-ONLY INFERENCE (TRAIN) for calibration ----
+    # Rate-only inference for calibration
     def run_inference_rate_only(self, use_adapter: bool, split: str = "train"):
         mode = "ft" if use_adapter else "zeroshot"
         logging.info(f"--- Rate-only logits: {mode.upper()} on {split.upper()} ---")
@@ -747,7 +740,7 @@ class ModelManager:
 
         df = pd.read_csv(CFG.DATA_DIR / f"{split}_clean.csv")
 
-        # per la calibrazione ci basta un subset del TRAIN
+        # calibration only requires a manageable subset of the TRAIN split
         if split == "train" and CFG.CALIB_TRAIN_MAX_EXAMPLES is not None:
             if len(df) > CFG.CALIB_TRAIN_MAX_EXAMPLES:
                 logging.info(
@@ -773,25 +766,23 @@ class ModelManager:
         pd.DataFrame(results).to_csv(out_path, index=False)
         logging.info(f"Saved {out_path}")
 
-    # -----------------
     # JSON helpers
-    # -----------------
     @staticmethod
     def _extract_json(text: str) -> Dict[str, Any]:
         """
-        Estrae il primo oggetto JSON ben formato nel testo.
+        Extract the first well-formed JSON object appearing in the text.
         """
         if not isinstance(text, str):
             return {}
 
-        # prova match con bilanciamento grezzo
+        # crude brace matching to locate a JSON blob quickly
         m = re.search(r"\{[\s\S]*\}", text)
         if not m:
             return {}
 
         blob = m.group(0).strip()
 
-        # ripulisci trailing junk dopo ultimo }
+        # trim junk after the last closing brace
         last = blob.rfind("}")
         blob = blob[:last + 1]
 
@@ -806,7 +797,7 @@ class ModelManager:
     @staticmethod
     def _ensure_non_empty_sw(obj: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Assicura che strengths/weaknesses siano liste non vuote.
+        Ensure strengths/weaknesses are non-empty lists.
         """
         if not isinstance(obj, dict):
             obj = {}
@@ -839,7 +830,7 @@ class ModelManager:
     @staticmethod
     def _fallback_sw(title: str, abstract: str) -> Dict[str, Any]:
         """
-        Fallback rapidissimo e safe (mai vuoto).
+        Fast, safe fallback that is never empty.
         """
         strengths = [
             "The paper addresses a relevant problem and is clearly motivated."
@@ -850,9 +841,7 @@ class ModelManager:
         return {"strengths": strengths, "weaknesses": weaknesses}
 
 
-# ---------------------------
 # 3. EVALUATOR
-# ---------------------------
 class Evaluator:
     def __init__(self):
         self.calibrators = {}
@@ -923,43 +912,41 @@ class Evaluator:
             "Pearson": float(pearsonr(yt, yp)[0]) if len(yt) > 1 else 0.0,
         }
 
-# ---------------------------
 # 4. S/W QUALITY EVALUATOR
-# ---------------------------
 class SWQualityEvaluator:
     """
-    Valuta la qualità delle Strengths/Weaknesses generate:
+    Evaluate the quality of the generated Strengths/Weaknesses by tracking:
 
-    - Percentuale di fallback (S/W uguale alle frasi di default)
-    - Diversità lessicale normalizzata dei bullet
-    - Similarità (cosine) tra Teacher S/W e ZS / FT (semi-automatica)
+    - Percentage of fallback outputs (S/W equals the default sentences)
+    - Normalized lexical diversity of the bullet lists
+    - Cosine similarity between Teacher S/W and Zeroshot / Finetuned predictions
     """
 
-    # frasi di fallback definite in ModelManager._fallback_sw
+    # fallback sentences defined in ModelManager._fallback_sw
     FALLBACK_STRENGTH = "The paper addresses a relevant problem and is clearly motivated."
     FALLBACK_WEAKNESS = "The abstract leaves some methodological or evaluation details unclear."
 
     def __init__(self):
-        # modello di embedding leggero (se disponibile)
+        # lightweight embedding model (if available)
         if SentenceTransformer is not None:
             self.embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
         else:
             self.embedder = None
 
-    # ---------- helper per parsing JSON ----------
+    # JSON parsing helpers 
 
     @staticmethod
     def _load_sw_from_json_str(js: str) -> Tuple[list, list]:
         """
-        Prende una stringa JSON e restituisce (strengths, weaknesses) come liste di stringhe.
-        Se il JSON è rotto o manca, restituisce liste vuote.
+        Parse a JSON string and return (strengths, weaknesses) as string lists.
+        Return empty lists when JSON is missing or malformed.
         """
         if not isinstance(js, str) or js.strip() == "":
             return [], []
         try:
             obj = json.loads(js)
         except Exception:
-            # a volte i CSV possono avere doppi apici incasinati, riprova con ast.literal_eval
+            # CSV quoting sometimes breaks JSON; fall back to ast.literal_eval
             try:
                 obj = ast.literal_eval(js)
             except Exception:
@@ -973,7 +960,7 @@ class SWQualityEvaluator:
         if isinstance(w, str):
             w = [w]
 
-        # filtra eventuali elementi non stringa
+        # filter out non-string entries
         s = [str(x).strip() for x in s if str(x).strip()]
         w = [str(x).strip() for x in w if str(x).strip()]
         return s, w
@@ -981,9 +968,8 @@ class SWQualityEvaluator:
     @classmethod
     def _is_fallback(cls, strengths: list, weaknesses: list) -> bool:
         """
-        Consideriamo fallback i casi in cui:
-        - c'è esattamente 1 strength = frase default
-        - c'è esattamente 1 weakness = frase default
+        A fallback occurs when both strengths and weaknesses contain
+        exactly one bullet matching the default text.
         """
         return (
             len(strengths) == 1
@@ -995,14 +981,13 @@ class SWQualityEvaluator:
     @staticmethod
     def _lexical_diversity(bullets: list) -> float:
         """
-        Diversità lessicale normalizzata:
-        |vocab| / |tokens|.
-        Ritorna 0.0 se non ci sono token.
+        Normalized lexical diversity = |vocab| / |tokens|.
+        Returns 0.0 when there are no tokens.
         """
         text = " ".join(bullets).strip()
         if not text:
             return 0.0
-        # split banale su spazio -> sufficiente per una misura globale
+        # simple whitespace split is sufficient for a coarse metric
         tokens = text.split()
         if not tokens:
             return 0.0
@@ -1011,8 +996,8 @@ class SWQualityEvaluator:
 
     def _encode(self, texts: list) -> np.ndarray:
         """
-        Codifica una lista di stringhe in un embedding medio.
-        Se l'embedder non è disponibile, restituisce None.
+        Encode a list of strings into an averaged embedding.
+        Returns None if the embedder is unavailable.
         """
         if self.embedder is None or not texts:
             return None
@@ -1030,20 +1015,18 @@ class SWQualityEvaluator:
             return None
         return float(np.dot(u, v) / (nu * nv))
 
-    # ---------- main evaluation ----------
+    # main evaluation
 
     def evaluate_sw_quality(self) -> Dict[str, Any]:
         """
-        Valuta la qualità delle S/W su VALIDATION.
-
-        Usa:
-        - teacher S/W da val_sw_targets.csv
-        - predizioni zero-shot da val_zeroshot_results.csv
-        - predizioni fine-tuned da val_ft_results.csv
+        Evaluate S/W quality on VALIDATION using:
+        - teacher S/W from val_sw_targets.csv
+        - zero-shot predictions from val_zeroshot_results.csv
+        - finetuned predictions from val_ft_results.csv
         """
         logging.info("--- S/W QUALITY EVALUATION on VALIDATION ---")
 
-        # Teacher S/W su validation (potrebbe essere un subset)
+        # Teacher S/W on validation (possibly a subset)
         teacher_path = CFG.DATA_DIR / "val_sw_targets.csv"
         zs_path = CFG.RESULTS_DIR / "val_zeroshot_results.csv"
         ft_path = CFG.RESULTS_DIR / "val_ft_results.csv"
@@ -1059,7 +1042,7 @@ class SWQualityEvaluator:
         df_zs = pd.read_csv(zs_path)[["title", "parsed_json"]].set_index("title")
         df_ft = pd.read_csv(ft_path)[["title", "parsed_json"]].set_index("title")
 
-        # Consideriamo solo l'intersezione dei titoli presenti in tutte e tre
+        # Consider only titles present in all three sources
         common_titles = df_teacher.index.intersection(df_zs.index).intersection(df_ft.index)
 
         if len(common_titles) == 0:
@@ -1070,7 +1053,7 @@ class SWQualityEvaluator:
 
         n = len(common_titles)
 
-        # Counters per metriche globali
+        # Counters for global metrics
         fallback_zs = 0
         fallback_ft = 0
 
@@ -1081,25 +1064,25 @@ class SWQualityEvaluator:
         sims_teacher_ft = []
 
         for title in tqdm(common_titles, desc="S/W quality val"):
-            # --- teacher ---
+            # teacher
             t_s, t_w = self._load_sw_from_json_str(df_teacher.loc[title, "target_json"])
             txt_teacher = "Strengths: " + " ".join(t_s) + " Weaknesses: " + " ".join(t_w)
 
-            # --- zeroshot ---
+            # zeroshot
             zs_s, zs_w = self._load_sw_from_json_str(df_zs.loc[title, "parsed_json"])
             if self._is_fallback(zs_s, zs_w):
                 fallback_zs += 1
             bullets_zs.extend(zs_s + zs_w)
             txt_zs = "Strengths: " + " ".join(zs_s) + " Weaknesses: " + " ".join(zs_w)
 
-            # --- fine-tuned ---
+            # fine-tuned 
             ft_s, ft_w = self._load_sw_from_json_str(df_ft.loc[title, "parsed_json"])
             if self._is_fallback(ft_s, ft_w):
                 fallback_ft += 1
             bullets_ft.extend(ft_s + ft_w)
             txt_ft = "Strengths: " + " ".join(ft_s) + " Weaknesses: " + " ".join(ft_w)
 
-            # --- embedding-based similarity (se disponibile) ---
+            # embedding-based similarity 
             if self.embedder is not None:
                 emb_teacher = self._encode([txt_teacher])
                 emb_zs = self._encode([txt_zs])
@@ -1113,7 +1096,7 @@ class SWQualityEvaluator:
                 if sim_t_ft is not None:
                     sims_teacher_ft.append(sim_t_ft)
 
-        # --- metriche globali ---
+        # final metrics
         fallback_rate_zs = fallback_zs / n
         fallback_rate_ft = fallback_ft / n
 
@@ -1147,9 +1130,7 @@ class SWQualityEvaluator:
 
         return metrics
 
-# ---------------------------
 # MAIN
-# ---------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
